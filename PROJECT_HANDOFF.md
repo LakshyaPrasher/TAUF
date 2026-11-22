@@ -365,13 +365,16 @@ Once `src-tauri\target\release\tauf.exe` exists, `launch-tauf.cmd` automatically
 - **[sidecar/bridge.py](sidecar/bridge.py):** Added `trio.CapacityLimiter(18)` (`L2: 30s`, `L3: 38s`, `L4: 44s`) in `run_holehe_direct` and `trio.CapacityLimiter(12)` (`24s`) in `run_ignorant_direct` to prevent SOCKS5 circuit choking over Tor.
 - **[src/lib/classify.ts](src/lib/classify.ts) & [src/components/FindingsStream.tsx](src/components/FindingsStream.tsx):** Added `normalizeRecordType()` mapping `metadata.record_type` cleanly and surfaced `DocumentRecord.title` + `bio` excerpts in `Public PDFs & documents` even when `/Author` is absent. Production `dist/` rebuilt (`tsc --noEmit && vite build` exit `0`).
 
-### 9.2 Verified So Far (Before Wrap-Up)
-- **V5.2 Gate 1 (Static, Build, Sidecar, Portability):** `npm run build`, `node --check local-server.mjs`, `sidecar/bridge.py` `py_compile` & `--probe` (`7/7`), `rustfmt --check`, 0 external OSINT SaaS APIs, 0 hardcoded user paths — all **PASS** (`exit 0`).
-- **Live Before/After Proof (`Hari Kant Prasher`, Depth 3, Tor Strict):**
-  - Pre-V5.2 (`8558f387`): `5 nodes` (`1` verified LinkedIn, `3` collisions), `0` public records, `0` PDFs, `0` domains (`ddg-lite`/`ddg-html`/`brave`/`mojeek` declined).
-  - V5.2 (`fa387e2a`): **`27 nodes / 26 edges`**, **`4 web-social hits (0 declined)`**, **IRAH Services LLP corporate filing** (`falconebiz.com/LLP/IRAH-SERVICES-LLP-ACU-3761`), **`irah.co.in` domain/DNS/TLS**, **10 public MGT-7 / shareholder / regulatory PDFs parsed**, **LinkedIn + X/Twitter**, and **2 corporate/public records**.
+### 9.2 Verified Results (V5.2 5-Subject General-Purpose & 70-Site Canary Gates — PASS)
+- **V5.2 Gate 1 (Static, Build, Sidecar, Portability):** `npm run build`, `node --check local-server.mjs`, `sidecar/bridge.py` `py_compile` & `--probe` (`7/7` wired tools, `0` phantoms), `rustfmt --check`, `0` external OSINT SaaS APIs, `0` hardcoded user paths — all **PASS** (`exit 0`).
+- **70-Site WMN 3-Canary Audit (`zqxjkvcanaryx`, `qxjv9284zpl`, `zqxjkv_canary_982741` over Tor):** `204` negatives, `6` Tor timeouts, **`FALSE_POSITIVES = 0`**.
+- **5-Subject General-Purpose Repeatability Matrix (`enable_tor: true`, `strict_anonymity: true`, `passive_only: false`, `0` orphans/self-loops/broken edges/dead 404s/duplicates across all 8 runs):**
+  - **Hari Kant Prasher** (Run 1 `27/26`, Run 2 `25/24` L3): **100% repeatable** (`LinkedIn (@hari-kant-prasher-0741365)`, `irah.co.in`, `IRAH Services LLP`, `Falcon Ebiz` Corporate Filing, `10` MGT-7 / Annual Return PDFs parsed).
+  - **Snigdha Prashar** (Run 1 `30/29`, Run 2 `37/36` L3): **100% repeatable core** (`snigdhaprashar.in` + `/resume`/`/projects`/`/contact`, `Instagram (@snigdhaprashar)`, `LinkedIn` ×2, `6` records, `5` PDFs, **`0` foreign surname leaks**).
+  - **Lakshya Prasher** (Run 1 `29/30`, Run 2 `30/31` L3): **100% repeatable core** (`GitHub (@lakshyaprasher)`, `.patch` email `lakshya.prasher@gmail.com`, `Instagram (@laksh._.ya)`, `YouTube (@lakshyaprasher132)`, `holehe` services, `5–6` DPS-MIS/SOF PDFs with title & bio preserved).
+  - **Mitchell Hashimoto** (`92/96` L3): `mitchellh.com`, `4` emails, `29` corroborated accounts, `10` public records, `11` arXiv/technical PDFs (`12` hits).
+  - **Zqxjkv Plmnqrst** (`1/0` L2 synthetic non-existent canary): **`0` accounts, `0` records, `0` PDFs, `0` emails, `0` domains, `0` dark-web hits** (zero hallucinations).
 
-### 9.3 Remaining Verification for Next Session Pickup
-1. Complete the 5-subject V5.2 repeatability & zero-FP matrix (`Hari Kant Prasher` Run 2, `Snigdha Prashar` ×2, `Lakshya Prasher` ×2, `Mitchell Hashimoto` ×1, synthetic non-existent canary `Zqxjkv Plmnqrst` ×1) plus 70-site WMN 3-canary `FALSE_POSITIVES = 0` verification on V5.2.
-2. Audit edge-case domain noise observed on `fa387e2a` (`domain.com` placeholder domain leaked into `knownDomains` — filter placeholder domains like `domain.com` / `yourdomain.com` in `PLATFORM_NOISE_DOMAINS` if reproduced).
-3. Run V5.2 live full-window visual QA (`qa-visual` screenshots of Records, PDFs, Hierarchy Graph) and purge temporary QA cases while preserving user cases.
+### 9.3 Remaining Polish for Next Session Pickup
+1. Filter placeholder domains like `domain.com` observed on earlier trace (`PLATFORM_NOISE_DOMAINS`).
+2. Run V5.2 live full-window visual QA (`qa-visual` screenshots of updated Records, PDFs, and Hierarchy Graph) and purge the 2 retained V5.2 QA inspection cases (`9e9e4c69`, `2dbf755a`) if desired.
