@@ -349,3 +349,29 @@ Once `src-tauri\target\release\tauf.exe` exists, `launch-tauf.cmd` automatically
 
 1. **Port V5.1 Node Engine Enhancements to `src-tauri/src/engine/*.rs`:** Once `cargo.exe` is whitelisted on the host, mirror Startpage-over-Tor + RFC 1929 `IsolateSOCKSAuth`, partial gzip decompression, `classifyOnionHit`, `authorConflictsFirstName`, and `ensureGraphIntegrity` into the Rust engine modules so native `tauf.exe` and `local-server.mjs` remain 100% behavioral twins.
 2. **Optional Multi-Circuit Startpage Fallback Tuning:** Expand `IsolateSOCKSAuth` retry budget selectively for `L3`/`L4` traces when a busy Tor exit returns an HTTP 403/Access Denied on Startpage.
+
+---
+
+## 9. V5.2 Checkpoint (`v5.2-universal-osint` — Next Session Pickup)
+
+### 9.1 Implemented & Built in V5.2
+- **[local-server.mjs](local-server.mjs) (`SERVER_BUILD_ID = "v5.2-universal-osint"`):**
+  - Fixed `parseSearchResults("startpage", ...)` title extraction so `<h2 class="wgl-title ...">` is matched instead of `<div class="wgl-title-link-container">`, recovering full result titles for `hasFullNameMatch` filtering across social profiles, corporate filings, websites, and PDFs.
+  - Upgraded `queryStartpageWithRetry` + `runDorkCascade` to `15000ms` timeout with up to 3 attempts across distinct RFC 1929 `IsolateSOCKSAuth` Tor circuits on both challenges and timeouts without permanently banning Startpage across queries; avoids unnecessary backup engine fallthrough after clean HTTP `200 OK`, and captures PDFs/websites/records discovered on any query kind.
+  - Added personal & company website promotion (`isPersonalOrCompanyWebsiteCandidate`) into `out.websites`, `knownDomains`, and `record` nodes (`Personal / Company Website`).
+  - Upgraded `discoverPublicRecords()` into a global public-records engine: CourtListener + arXiv + direct IndianKanoon HTML + Startpage corporate/LLP/MGT-7 filings (`Corporate Filing`) + global legal/patent/academic/PDF discovery, emitting `metadata.record_type` cleanly.
+  - Removed the `4MB` `content-length` drop in `fetchAndParsePdf` (already bounded to `2MB` via HTTP `Range`) and added `pdfMetaMap` fallback preservation so verified public PDFs emit `document` nodes even when Info/XMP metadata is stripped.
+  - Added 1 fast fresh-circuit retry in `runWmnForHandle` for transient Tor timeouts.
+- **[sidecar/bridge.py](sidecar/bridge.py):** Added `trio.CapacityLimiter(18)` (`L2: 30s`, `L3: 38s`, `L4: 44s`) in `run_holehe_direct` and `trio.CapacityLimiter(12)` (`24s`) in `run_ignorant_direct` to prevent SOCKS5 circuit choking over Tor.
+- **[src/lib/classify.ts](src/lib/classify.ts) & [src/components/FindingsStream.tsx](src/components/FindingsStream.tsx):** Added `normalizeRecordType()` mapping `metadata.record_type` cleanly and surfaced `DocumentRecord.title` + `bio` excerpts in `Public PDFs & documents` even when `/Author` is absent. Production `dist/` rebuilt (`tsc --noEmit && vite build` exit `0`).
+
+### 9.2 Verified So Far (Before Wrap-Up)
+- **V5.2 Gate 1 (Static, Build, Sidecar, Portability):** `npm run build`, `node --check local-server.mjs`, `sidecar/bridge.py` `py_compile` & `--probe` (`7/7`), `rustfmt --check`, 0 external OSINT SaaS APIs, 0 hardcoded user paths — all **PASS** (`exit 0`).
+- **Live Before/After Proof (`Hari Kant Prasher`, Depth 3, Tor Strict):**
+  - Pre-V5.2 (`8558f387`): `5 nodes` (`1` verified LinkedIn, `3` collisions), `0` public records, `0` PDFs, `0` domains (`ddg-lite`/`ddg-html`/`brave`/`mojeek` declined).
+  - V5.2 (`fa387e2a`): **`27 nodes / 26 edges`**, **`4 web-social hits (0 declined)`**, **IRAH Services LLP corporate filing** (`falconebiz.com/LLP/IRAH-SERVICES-LLP-ACU-3761`), **`irah.co.in` domain/DNS/TLS**, **10 public MGT-7 / shareholder / regulatory PDFs parsed**, **LinkedIn + X/Twitter**, and **2 corporate/public records**.
+
+### 9.3 Remaining Verification for Next Session Pickup
+1. Complete the 5-subject V5.2 repeatability & zero-FP matrix (`Hari Kant Prasher` Run 2, `Snigdha Prashar` ×2, `Lakshya Prasher` ×2, `Mitchell Hashimoto` ×1, synthetic non-existent canary `Zqxjkv Plmnqrst` ×1) plus 70-site WMN 3-canary `FALSE_POSITIVES = 0` verification on V5.2.
+2. Audit edge-case domain noise observed on `fa387e2a` (`domain.com` placeholder domain leaked into `knownDomains` — filter placeholder domains like `domain.com` / `yourdomain.com` in `PLATFORM_NOISE_DOMAINS` if reproduced).
+3. Run V5.2 live full-window visual QA (`qa-visual` screenshots of Records, PDFs, Hierarchy Graph) and purge temporary QA cases while preserving user cases.

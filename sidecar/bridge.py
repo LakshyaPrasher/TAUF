@@ -310,9 +310,11 @@ def stream_python_code(
     return rc, lines
 
 
-def run_holehe_direct(email: str, active_proxy: str | None) -> list[dict[str, Any]]:
-    """Run Holehe modules directly via Trio + httpx (socksio) with strict 24s cap so hung modules never stall."""
+def run_holehe_direct(email: str, active_proxy: str | None, depth_level: int = 2) -> list[dict[str, Any]]:
+    """Run Holehe modules directly via Trio + httpx (socksio) with CapacityLimiter(18) so Tor circuits aren't choked."""
     httpx_proxy = to_httpx_socks5(active_proxy)
+    trio_timeout = {2: 30, 3: 38, 4: 44}.get(depth_level, 30)
+    subproc_timeout = trio_timeout + 8
     code = f"""
 import json, trio, httpx
 from holehe.core import import_submodules, get_functions, launch_module
@@ -321,20 +323,26 @@ async def _go():
     modules = import_submodules("holehe.modules")
     funcs = get_functions(modules)
     out = []
-    client_kwargs = {{"timeout": httpx.Timeout(6.5, connect=5.0)}}
+    limiter = trio.CapacityLimiter(18)
+    client_kwargs = {{"timeout": httpx.Timeout(8.0, connect=6.5)}}
     if {json.dumps(httpx_proxy)}:
         client_kwargs["proxy"] = {json.dumps(httpx_proxy)}
+
+    async def _run_mod(fn, client):
+        async with limiter:
+            await launch_module(fn, {json.dumps(email)}, client, out)
+
     async with httpx.AsyncClient(**client_kwargs) as client:
-        with trio.move_on_after(24):
+        with trio.move_on_after({trio_timeout}):
             async with trio.open_nursery() as nursery:
                 for fn in funcs:
-                    nursery.start_soon(launch_module, fn, {json.dumps(email)}, client, out)
+                    nursery.start_soon(_run_mod, fn, client)
     hits = [r for r in out if isinstance(r, dict) and r.get("exists") is True]
     print("HOLEHE_JSON:" + json.dumps({{"checked": len(out), "hits": hits}}, ensure_ascii=False))
 
 trio.run(_go)
 """
-    rc, lines = stream_python_code(code, build_clean_env(None), timeout=30)
+    rc, lines = stream_python_code(code, build_clean_env(None), timeout=subproc_timeout)
     for ln in reversed(lines):
         if ln.startswith("HOLEHE_JSON:"):
             try:
@@ -345,7 +353,7 @@ trio.run(_go)
 
 
 def run_ignorant_direct(cc: str, num: str, active_proxy: str | None) -> list[dict[str, Any]]:
-    """Run Ignorant modules directly via Trio + httpx (socksio) with strict 18s cap."""
+    """Run Ignorant modules directly via Trio + httpx (socksio) with CapacityLimiter(12) and 24s cap."""
     httpx_proxy = to_httpx_socks5(active_proxy)
     code = f"""
 import json, trio, httpx
@@ -355,20 +363,26 @@ async def _go():
     modules = import_submodules("ignorant.modules")
     funcs = get_functions(modules)
     out = []
-    client_kwargs = {{"timeout": httpx.Timeout(6.5, connect=5.0)}}
+    limiter = trio.CapacityLimiter(12)
+    client_kwargs = {{"timeout": httpx.Timeout(8.0, connect=6.5)}}
     if {json.dumps(httpx_proxy)}:
         client_kwargs["proxy"] = {json.dumps(httpx_proxy)}
+
+    async def _run_mod(fn, client):
+        async with limiter:
+            await launch_module(fn, {json.dumps(num)}, {json.dumps(cc)}, client, out)
+
     async with httpx.AsyncClient(**client_kwargs) as client:
-        with trio.move_on_after(18):
+        with trio.move_on_after(24):
             async with trio.open_nursery() as nursery:
                 for fn in funcs:
-                    nursery.start_soon(launch_module, fn, {json.dumps(num)}, {json.dumps(cc)}, client, out)
+                    nursery.start_soon(_run_mod, fn, client)
     hits = [r for r in out if isinstance(r, dict) and r.get("exists") is True]
     print("IGNORANT_JSON:" + json.dumps({{"checked": len(out), "hits": hits}}, ensure_ascii=False))
 
 trio.run(_go)
 """
-    rc, lines = stream_python_code(code, build_clean_env(None), timeout=24)
+    rc, lines = stream_python_code(code, build_clean_env(None), timeout=30)
     for ln in reversed(lines):
         if ln.startswith("IGNORANT_JSON:"):
             try:
@@ -544,7 +558,7 @@ def run_sidecar(payload: dict[str, Any]) -> None:
             return
 
         # -----------------------------------------------------------------
-        # 2. holehe — Direct in-process Trio + httpx (socksio) with 24s cap
+        # 2. holehe — Direct in-process Trio + httpx (socksio) with CapacityLimiter(18)
         # -----------------------------------------------------------------
         if name == "holehe":
             if not emails:
@@ -555,7 +569,7 @@ def run_sidecar(payload: dict[str, Any]) -> None:
             seen_doms = set()
             emitted = 0
             for em in target_emails:
-                found_hits = run_holehe_direct(em, active_proxy)
+                found_hits = run_holehe_direct(em, active_proxy, depth_level=depth_level)
                 for item in found_hits:
                     dom = str(item.get("domain") or item.get("name") or "").strip()
                     key = f"{dom}:{em}"

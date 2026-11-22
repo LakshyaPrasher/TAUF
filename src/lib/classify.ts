@@ -149,6 +149,8 @@ export interface DocumentRecord {
   key: string;
   nodeId: string;
   filename: string;
+  title: string | null;
+  bio: string | null;
   author: string | null;
   creator: string | null;
   leakedPathUser: string | null;
@@ -645,6 +647,69 @@ function precisionRank(p: OnionMatchPrecision): number {
   return 1;
 }
 
+function normalizeRecordType(node: GraphNode): string {
+  const explicit = sanitizeDisplayText(node.metadata?.record_type);
+  const canonical = new Set([
+    "Corporate Filing",
+    "Legal / Court Record",
+    "Academic Publication",
+    "Public Web Record",
+    "Media / Talk",
+    "Personal / Company Website",
+    "Academic & Public Document",
+  ]);
+  if (explicit && canonical.has(explicit)) {
+    return explicit;
+  }
+
+  const probe = [
+    explicit,
+    node.metadata?.category,
+    node.sublabel,
+    node.kind,
+    node.url,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+
+  if (
+    /\b(corporate|filing|director|llp|cin|din|annual return|mgt-7|zaubacorp|falconebiz|tofler|opencorporates|companieshouse|thecompanycheck)\b/.test(
+      probe
+    ) ||
+    node.kind.toLowerCase() === "org" ||
+    node.kind.toLowerCase() === "organization"
+  ) {
+    return "Corporate Filing";
+  }
+  if (
+    /\b(legal|court|judgment|docket|tribunal|gazette|indiankanoon|courtlistener|patent)\b/.test(
+      probe
+    )
+  ) {
+    return "Legal / Court Record";
+  }
+  if (
+    /\b(academic|publication|arxiv|thesis|researchgate|scholar|paper)\b/.test(
+      probe
+    )
+  ) {
+    return "Academic Publication";
+  }
+  if (/\b(media|talk|video|youtube|interview|podcast|keynote)\b/.test(probe)) {
+    return "Media / Talk";
+  }
+  if (
+    /\b(personal\s*\/\s*company\s*website|website|portfolio|homepage)\b/.test(
+      probe
+    )
+  ) {
+    return "Personal / Company Website";
+  }
+  if (explicit) return explicit;
+  return "Public Web Record";
+}
+
 function cleanServiceName(raw: string): string {
   return raw
     .replace(/^(holehe|ignorant)\s*[:·-]\s*/i, "")
@@ -1007,13 +1072,7 @@ export function classifyIntel(
         key,
         nodeId: node.id,
         title: sanitizeDisplayText(node.label) || node.label,
-        recordType:
-          sanitizeDisplayText(
-            node.metadata?.record_type ||
-              node.metadata?.category ||
-              node.sublabel ||
-              node.kind
-          ) || node.kind,
+        recordType: normalizeRecordType(node),
         sourceDomain:
           node.metadata?.source_domain || extractDomainFromUrl(node.url),
         excerpt: sanitizeDisplayText(
@@ -1101,11 +1160,19 @@ export function classifyIntel(
 
     const filename = (node.metadata?.filename || node.label).trim();
     const key = (node.url || filename).toLowerCase();
+    const linkedFinding = findingsByNode.get(node.id)?.[0];
     if (!docMap.has(key)) {
       docMap.set(key, {
         key,
         nodeId: node.id,
         filename: sanitizeDisplayText(filename) || filename,
+        title: sanitizeDisplayText(node.metadata?.title),
+        bio: sanitizeDisplayText(
+          node.metadata?.bio ||
+            node.metadata?.snippet ||
+            node.metadata?.excerpt ||
+            linkedFinding?.summary
+        ),
         author: sanitizeDisplayText(node.metadata?.author),
         creator: sanitizeDisplayText(
           node.metadata?.creator || node.metadata?.producer

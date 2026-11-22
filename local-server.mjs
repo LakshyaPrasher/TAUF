@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SERVER_BUILD_ID = "v5.1-sovereign-verified";
+const SERVER_BUILD_ID = "v5.2-universal-osint";
 
 const DIST_DIR = path.join(__dirname, "dist");
 const WMN_PATH = path.join(__dirname, "src-tauri", "resources", "wmn_curated.json");
@@ -2287,13 +2287,37 @@ async function runWmnForHandle(
   const workers = netCtx?.proxyHost ? Math.min(Math.max(concurrency, 18), 20) : concurrency;
   const deadline = Date.now() + (budgetMs || (netCtx?.proxyHost ? 18_000 : 14_000));
 
+  const wmnNonce = Math.floor(Date.now() / 1000).toString(36);
+  let wmnRetrySeq = 0;
+
   async function worker() {
     while (cursor < targetSites.length && Date.now() < deadline) {
       const site = targetSites[cursor++];
       const checkUrl = site.uri_check.replace("{account}", encoded);
       const prettyUrl = site.uri_pretty.replace("{account}", encoded);
+      let resp = null;
       try {
-        const resp = await sovereignFetch(checkUrl, { maxBytes: 140_000, jitter: false }, netCtx, 6000);
+        resp = await sovereignFetch(checkUrl, { maxBytes: 140_000, jitter: false }, netCtx, 6000);
+      } catch (err) {
+        if (String(err?.message || "").includes("STRICT_ANONYMITY_BLOCKED")) break;
+        // 1 fast retry on transient Tor timeout/network error using a fresh circuit within budget
+        if (netCtx?.proxyHost && Date.now() + 2500 < deadline) {
+          try {
+            resp = await sovereignFetch(
+              checkUrl,
+              { maxBytes: 140_000, jitter: false, socksUser: `wmn-${wmnNonce}-${++wmnRetrySeq}` },
+              netCtx,
+              5500
+            );
+          } catch {
+            continue;
+          }
+        } else {
+          continue;
+        }
+      }
+      if (!resp) continue;
+      try {
         if (resp.status === site.m_code && site.m_code !== site.e_code) continue;
         if (resp.status !== site.e_code) continue;
         const rawHtml = (await resp.text()).slice(0, 140_000);
@@ -2326,7 +2350,7 @@ async function runWmnForHandle(
           outbound_urls: signals.outboundUrls,
         });
       } catch {
-        // timeout / unreachable
+        // parse / read error
       }
     }
   }
@@ -2585,8 +2609,6 @@ async function fetchAndParsePdf(url, netCtx) {
       11000
     );
     if (!r.ok) return null;
-    const cl = Number(r.headers.get("content-length") || 0);
-    if (cl > 4_194_304) return null;
     const ab = await r.arrayBuffer();
     const buf = (Buffer.isBuffer(ab) ? ab : Buffer.from(ab)).subarray(0, 2_097_152);
     if (!buf.subarray(0, 1024).includes(Buffer.from("%PDF"))) return null;
@@ -2956,24 +2978,36 @@ function parseSearchResults(engineId, html) {
         .replace(/<style\b[\s\S]*?<\/style>/gi, " ")
         .replace(/\.css-[\w-]+\s*\{[^}]*\}/g, " ");
       let matchedA = null;
-      for (const m of blk.matchAll(/<a\b([^>]*href=["'](https?:\/\/[^"']+)["'][^>]*)>([\s\S]*?)<\/a>/gi)) {
-        const u = decodeSearchRedirectUrl(m[2]);
+      const priorityLink =
+        blk.match(/<a\b([^>]*data-testid=["']gl-title-link["'][^>]*)>([\s\S]*?)<\/a>/i) ||
+        blk.match(/<a\b([^>]*class=["'][^"']*\bresult-title\b[^"']*["'][^>]*)>([\s\S]*?)<\/a>/i);
+      if (priorityLink) {
+        const u = decodeSearchRedirectUrl(extractAttr(priorityLink[1], "href"));
         if (u.startsWith("http") && !/(?:^|\.)(?:startpage|ixquick)\.com(?:\/|$)/i.test(u)) {
-          matchedA = { href: u, inner: m[3] };
-          break;
+          matchedA = { href: u, inner: priorityLink[2] };
+        }
+      }
+      if (!matchedA) {
+        for (const m of blk.matchAll(/<a\b([^>]*href=["'](https?:\/\/[^"']+)["'][^>]*)>([\s\S]*?)<\/a>/gi)) {
+          const u = decodeSearchRedirectUrl(m[2]);
+          if (u.startsWith("http") && !/(?:^|\.)(?:startpage|ixquick)\.com(?:\/|$)/i.test(u)) {
+            matchedA = { href: u, inner: m[3] };
+            break;
+          }
         }
       }
       if (!matchedA) continue;
       const titleM =
-        blk.match(/class=["'][^"']*(?:wgl-title|result-title|search-result__title)[^"']*["'][^>]*>([\s\S]*?)<\/(?:span|div|a|h\d)>/i) ||
-        blk.match(/<(?:h2|h3)\b[^>]*>([\s\S]*?)<\/(?:h2|h3)>/i);
+        blk.match(/<h2\b[^>]*class=["'][^"']*\bwgl-title\b[^"']*["'][^>]*>([\s\S]*?)<\/h2>/i) ||
+        blk.match(/<a\b[^>]*data-testid=["']gl-title-link["'][^>]*>([\s\S]*?)<\/a>/i) ||
+        blk.match(/<h2\b[^>]*>([\s\S]*?)<\/h2>/i);
       const title = decodeHtmlEntities(
         (titleM ? titleM[1] : matchedA.inner)
           .replace(/<[^>]+>/g, " ")
           .replace(/\.css-[\w-]+\s*\{[^}]*\}/g, " ")
       );
       const snM =
-        blk.match(/<p\b[^>]*class=["'][^"']*(?:description|w-gl__description)[^"']*["'][^>]*>([\s\S]*?)<\/p>/i) ||
+        blk.match(/<p\b[^>]*class=["'][^"']*\bdescription\b[^"']*["'][^>]*>([\s\S]*?)<\/p>/i) ||
         blk.match(/<p\b[^>]*>([\s\S]*?)<\/p>/i);
       const snippet = snM
         ? decodeHtmlEntities(snM[1].replace(/<[^>]+>/g, " ").replace(/\.css-[\w-]+\s*\{[^}]*\}/g, " "))
@@ -3057,12 +3091,92 @@ function parseSearchResults(engineId, html) {
 }
 
 const SEARCH_ENGINES = [
-  { id: "startpage", buildUrl: (q) => `https://www.startpage.com/sp/search?query=${encodeURIComponent(q)}` },
+  { id: "startpage", timeoutMs: 15000, buildUrl: (q) => `https://www.startpage.com/sp/search?query=${encodeURIComponent(q)}` },
   { id: "ddg-lite", buildUrl: (q) => `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(q)}` },
   { id: "ddg-html", buildUrl: (q) => `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}` },
   { id: "brave", buildUrl: (q) => `https://search.brave.com/search?q=${encodeURIComponent(q)}` },
   { id: "mojeek", timeoutMs: 5000, buildUrl: (q) => `https://www.mojeek.com/search?q=${encodeURIComponent(q)}` },
 ];
+
+/**
+ * Resilient Startpage-over-Tor helper with up to 3 total attempts (initial + 2 retries)
+ * across 3 distinct RFC 1929 IsolateSOCKSAuth circuits on BOTH challenge and timeout/network error.
+ */
+async function queryStartpageWithRetry(query, netCtx, nextSocksUser, timeoutMs = 15000) {
+  const spUrl = `https://www.startpage.com/sp/search?query=${encodeURIComponent(query)}`;
+  const maxAttempts = netCtx?.proxyHost ? 3 : 1;
+  let lastReason = "timeout";
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const r = await sovereignFetch(
+        spUrl,
+        { maxBytes: 450_000, jitter: false, socksUser: nextSocksUser() },
+        netCtx,
+        timeoutMs
+      );
+      const html = r.ok ? await r.text() : "";
+      const challenge = detectSearchChallenge(r, html);
+      if (!challenge && r.ok) {
+        return { ok: true, items: parseSearchResults("startpage", html), reason: null };
+      }
+      lastReason = challenge || `HTTP ${r.status}`;
+    } catch (err) {
+      if (String(err?.message || "").includes("STRICT_ANONYMITY_BLOCKED")) {
+        return { ok: false, items: [], reason: "STRICT_ANONYMITY_BLOCKED", strictBlocked: true };
+      }
+      lastReason = "timeout";
+    }
+  }
+  return { ok: false, items: [], reason: lastReason };
+}
+
+const AGGREGATOR_OR_DIRECTORY_HOSTS = [
+  "youtube.com", "wikipedia.org", "indiankanoon.org", "courtlistener.com", "arxiv.org",
+  "zaubacorp.com", "falconebiz.com", "tofler.in", "opencorporates.com", "thecompanycheck.com",
+  "companieshouse.gov.uk", "scribd.com", "researchgate.net", "realtor.ca", "theprint.in",
+  "linkedin.com", "instagram.com", "facebook.com", "x.com", "twitter.com", "threads.net",
+  "reddit.com", "medium.com", "github.com", "gitlab.com", "dev.to", "kaggle.com",
+  "behance.net", "dribbble.com", "pinterest.com", "tiktok.com", "tumblr.com", "soundcloud.com",
+  "google.com", "bing.com", "duckduckgo.com", "startpage.com", "yahoo.com",
+];
+
+function isPersonalOrCompanyWebsiteCandidate(url, title, snippet, fullName) {
+  let host = "";
+  try {
+    host = new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!host || !host.includes(".")) return false;
+  if (PLATFORM_NOISE_DOMAINS.some((d) => host === d || host.endsWith(`.${d}`))) return false;
+  if (AGGREGATOR_OR_DIRECTORY_HOSTS.some((d) => host === d || host.endsWith(`.${d}`))) return false;
+  if (/\.(gov|edu|ac|nic)\.[a-z]{2}$|\.(gov|edu)$/i.test(host)) return false;
+  if (sharesNameToken(host, fullName)) return true;
+  const ctx = `${title || ""} ${snippet || ""}`;
+  return (
+    hasFullNameMatch(ctx, fullName) &&
+    /\b(resume|cv|portfolio|about|founder|co-founder|director|managing director|md|partner|ceo|cto|company|private limited|pvt\.?\s*ltd|llp|studio|agency|ventures|consulting)\b/i.test(
+      ctx
+    )
+  );
+}
+
+function inferRecordType(url, title, snippet, fallback = "Public Web Record") {
+  const combined = `${url || ""} ${title || ""} ${snippet || ""}`.toLowerCase();
+  if (/courtlistener\.com|indiankanoon\.org|\b(court|judgment|judgement|docket|tribunal|petition|bail|bench|vs\.|v\.)\b/i.test(combined)) {
+    return "Legal / Court Record";
+  }
+  if (/zaubacorp|falconebiz|tofler\.in|opencorporates|thecompanycheck|companieshouse|\b(form mgt-7|mgt-7|annual return|\bcin\b|\bdin\b|llp|directorship|managing director|board of directors|incorporation)\b/i.test(combined)) {
+    return "Corporate Filing";
+  }
+  if (/arxiv\.org|researchgate\.net|scholar\.google|\b(patent|publication|thesis|journal|proceedings|doi:|preprint)\b/i.test(combined)) {
+    return "Academic Publication";
+  }
+  if (/youtube\.com\/watch|vimeo\.com|\b(keynote|interview|podcast|talk|panel)\b/i.test(combined)) {
+    return "Media / Talk";
+  }
+  return fallback;
+}
 
 function extractSocialAccountFromUrl(rawHref, title, fullName) {
   let cleanUrl = rawHref;
@@ -3385,13 +3499,132 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
     await Promise.all(Array.from({ length: 6 }, probeWorker));
   }
 
-  // 4. Respectful Multi-Engine Direct-HTML Public Search Cascade (with Tor IsolateSOCKSAuth per-query circuits)
+  // 4. Bulletproof Startpage-First Multi-Engine Direct-HTML Cascade (3-circuit IsolateSOCKSAuth retry)
   let circuitSeq = 0;
   const circuitNonce = Math.floor(Date.now() / 1000).toString(36);
   const nextSocksUser = () => `tauf-${circuitNonce}-${++circuitSeq}`;
+
+  const processSearchItems = (engId, kind, items, filterPlatform = null) => {
+    let engineHits = 0;
+    for (const item of items.slice(0, 10)) {
+      if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
+      const fullTextMatch =
+        hasFullNameMatch(`${item.title} ${item.snippet}`, fullName) ||
+        (hasFullNameMatch(item.url, fullName) && sharesNameToken(`${item.title} ${item.snippet}`, fullName));
+      if (!fullTextMatch) continue;
+
+      // Always capture public PDFs regardless of which query surfaced them
+      if (/\.pdf(?:$|[?#])/i.test(item.url) || item.url.toLowerCase().includes(".pdf")) {
+        if (!seenUrls.has(item.url)) {
+          seenUrls.add(item.url);
+          out.pdfs.push({
+            url: item.url,
+            sourceUrl: null,
+            title: item.title,
+            snippet: item.snippet,
+          });
+          engineHits++;
+        }
+        continue;
+      }
+
+      // Extract contacts on contact queries (without discarding websites/records below)
+      if (kind === "contact") {
+        let foundContact = false;
+        for (const emM of `${item.title} ${item.snippet}`.matchAll(/\b([A-Za-z0-9._%+\-]{2,64}@[A-Za-z0-9.\-]+\.[A-Za-z]{2,12})\b/g)) {
+          const em = emM[1].toLowerCase();
+          if (!isNoiseEmail(em) && !out.emails.includes(em)) {
+            out.emails.push(em);
+            foundContact = true;
+          }
+        }
+        for (const ph of extractPublicPhones(`${item.title} ${item.snippet}`)) {
+          if (!out.phones.includes(ph)) {
+            out.phones.push(ph);
+            foundContact = true;
+          }
+        }
+        if (foundContact) engineHits++;
+      }
+
+      // Check mainstream social / developer profile URLs
+      const acc = extractSocialAccountFromUrl(item.url, item.title, fullName);
+      if (acc) {
+        if (filterPlatform && acc.platform !== filterPlatform) continue;
+        const ownedSocial = sharesNameToken(acc.handle, fullName) || hasFullNameMatch(item.title, fullName);
+        if (!ownedSocial) continue;
+        seenUrls.add(item.url);
+        const added = recordAccount({
+          ...acc,
+          title: item.title,
+          bio: item.snippet,
+          confidence: 0.85,
+          match_tier: "verified",
+          match_reason: `${acc.platform} profile confirmed via ${engId}`,
+        });
+        if (added) engineHits++;
+        continue;
+      }
+
+      // Non-social web results: never drop real personal/company websites or public records even during social queries
+      let host = "";
+      try {
+        host = new URL(item.url).hostname.replace(/^www\./, "").toLowerCase();
+      } catch {
+        host = engId;
+      }
+      if (/(?:^|\.)(?:instagram\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|threads\.net)$/i.test(host)) {
+        continue;
+      }
+      if (seenUrls.has(item.url)) continue;
+      seenUrls.add(item.url);
+
+      const isPersonalOrCompany = isPersonalOrCompanyWebsiteCandidate(item.url, item.title, item.snippet, fullName);
+      if (isPersonalOrCompany && out.websites.length < 4 && !out.websites.some((w) => w.url === item.url)) {
+        out.websites.push({
+          url: item.url,
+          sourceUrl: null,
+          title: item.title,
+          snippet: item.snippet,
+        });
+      }
+
+      if (kind !== "contact" || isPersonalOrCompany) {
+        const recType = isPersonalOrCompany
+          ? "Personal / Company Website"
+          : inferRecordType(item.url, item.title, item.snippet, kind === "legal_corp" ? "Corporate Filing" : "Public Web Record");
+        out.records.push({
+          title: item.title,
+          url: item.url,
+          source: host,
+          snippet: item.snippet,
+          category: "corporate",
+          record_type: recType,
+        });
+        engineHits++;
+      }
+    }
+    return engineHits;
+  };
+
   const runDorkCascade = async (kind, query, filterPlatform = null) => {
     let matchedCount = 0;
-    for (const eng of SEARCH_ENGINES) {
+
+    // 1. Primary Engine: Startpage over Tor with up to 3 attempts on 3 distinct IsolateSOCKSAuth circuits
+    const spRes = await queryStartpageWithRetry(query, netCtx, nextSocksUser, 15000);
+    if (spRes.strictBlocked) return 0;
+    if (spRes.ok) {
+      matchedCount += processSearchItems("startpage", kind, spRes.items, filterPlatform);
+      // Do NOT fall through to backup engines when Startpage returned clean HTTP 200 OK HTML
+      return matchedCount;
+    }
+    // Never permanently ban Startpage across queries — only record per-query notice if all 3 circuits failed
+    if (spRes.reason) {
+      out.engineNotices.push(`startpage(${kind}): ${spRes.reason}`);
+    }
+
+    // 2. Fallback Engines only when Startpage failed all 3 circuits for this query
+    for (const eng of SEARCH_ENGINES.filter((e) => e.id !== "startpage")) {
       if (declinedEngines.has(eng.id)) continue;
       const lastTs = lastEngineHitAt.get(eng.id) || 0;
       const since = Date.now() - lastTs;
@@ -3410,7 +3643,7 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
         );
         let html = r.ok ? await r.text() : "";
         let challenge = detectSearchChallenge(r, html);
-        if (challenge && (eng.id === "startpage" || eng.id === "ddg-lite") && netCtx?.proxyHost) {
+        if (challenge && eng.id === "ddg-lite" && netCtx?.proxyHost) {
           r = await sovereignFetch(
             url,
             { maxBytes: 450_000, jitter: false, socksUser: nextSocksUser() },
@@ -3426,122 +3659,9 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
           continue;
         }
         const items = parseSearchResults(eng.id, html);
-        let engineHits = 0;
-        for (const item of items.slice(0, 10)) {
-          if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
-          const fullTextMatch =
-            hasFullNameMatch(`${item.title} ${item.snippet}`, fullName) ||
-            (hasFullNameMatch(item.url, fullName) && sharesNameToken(`${item.title} ${item.snippet}`, fullName));
-          if (!fullTextMatch) continue;
-
-          if (kind === "social" || kind === "dev_creator" || kind === "general") {
-            const acc = extractSocialAccountFromUrl(item.url, item.title, fullName);
-            if (acc) {
-              if (filterPlatform && acc.platform !== filterPlatform) continue;
-              const ownedSocial = sharesNameToken(acc.handle, fullName) || hasFullNameMatch(item.title, fullName);
-              if (!ownedSocial) continue;
-              seenUrls.add(item.url);
-              const added = recordAccount({
-                ...acc,
-                title: item.title,
-                bio: item.snippet,
-                confidence: 0.85,
-                match_tier: "verified",
-                match_reason: `${acc.platform} profile confirmed via ${eng.id}`,
-              });
-              if (added) {
-                engineHits++;
-                matchedCount++;
-              }
-              continue;
-            }
-            if (kind !== "general") continue;
-            if (item.url.toLowerCase().includes(".pdf")) {
-              if (!seenUrls.has(item.url)) {
-                seenUrls.add(item.url);
-                out.pdfs.push({ url: item.url, sourceUrl: null });
-                engineHits++;
-                matchedCount++;
-              }
-              continue;
-            }
-            if (!seenUrls.has(item.url)) {
-              seenUrls.add(item.url);
-              let host = "";
-              try {
-                host = new URL(item.url).hostname.replace(/^www\./, "");
-              } catch {
-                host = eng.id;
-              }
-              if (/(?:^|\.)(?:instagram\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|threads\.net)$/i.test(host)) {
-                continue;
-              }
-              out.records.push({
-                title: item.title,
-                url: item.url,
-                source: host,
-                snippet: item.snippet,
-                category: "corporate",
-              });
-              engineHits++;
-              matchedCount++;
-            }
-          } else if (kind === "pdf" || item.url.toLowerCase().includes(".pdf")) {
-            if (!seenUrls.has(item.url)) {
-              seenUrls.add(item.url);
-              out.pdfs.push({ url: item.url, sourceUrl: null });
-              engineHits++;
-              matchedCount++;
-            }
-          } else if (kind === "legal_corp") {
-            const socAcc = extractSocialAccountFromUrl(item.url, item.title, fullName);
-            if (socAcc) {
-              seenUrls.add(item.url);
-              continue;
-            }
-            if (!seenUrls.has(item.url)) {
-              seenUrls.add(item.url);
-              let host = "";
-              try {
-                host = new URL(item.url).hostname.replace(/^www\./, "");
-              } catch {
-                host = eng.id;
-              }
-              if (/(?:^|\.)(?:instagram\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|threads\.net)$/i.test(host)) {
-                continue;
-              }
-              out.records.push({
-                title: item.title,
-                url: item.url,
-                source: host,
-                snippet: item.snippet,
-                category: "corporate",
-              });
-              engineHits++;
-              matchedCount++;
-            }
-          } else if (kind === "contact") {
-            let foundContact = false;
-            for (const emM of `${item.title} ${item.snippet}`.matchAll(/\b([A-Za-z0-9._%+\-]{2,64}@[A-Za-z0-9.\-]+\.[A-Za-z]{2,12})\b/g)) {
-              const em = emM[1].toLowerCase();
-              if (!isNoiseEmail(em) && !out.emails.includes(em)) {
-                out.emails.push(em);
-                foundContact = true;
-              }
-            }
-            for (const ph of extractPublicPhones(`${item.title} ${item.snippet}`)) {
-              if (!out.phones.includes(ph)) {
-                out.phones.push(ph);
-                foundContact = true;
-              }
-            }
-            if (foundContact) {
-              engineHits++;
-              matchedCount++;
-            }
-          }
-        }
-        if (engineHits > 0) break; // Engine yielded verified matching results; stop cascade for this query
+        const engineHits = processSearchItems(eng.id, kind, items, filterPlatform);
+        matchedCount += engineHits;
+        if (engineHits > 0) break;
       } catch (err) {
         if (String(err?.message || "").includes("STRICT_ANONYMITY_BLOCKED")) break;
         declinedEngines.set(eng.id, "timeout/unreachable");
@@ -3573,10 +3693,19 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
  */
 async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
   const records = [];
-  const pdfLinks = []; // [{ url, parentRecordUrl }]
+  const pdfLinks = []; // [{ url, parentRecordUrl, title?, snippet? }]
   const seen = new Set();
+  const prNonce = `pr-${Math.floor(Date.now() / 1000).toString(36)}`;
+  let prSeq = 0;
+  const nextPrSocksUser = () => `${prNonce}-${++prSeq}`;
+
+  const addPdfLink = (url, parentRecordUrl = null, title = null, snippet = null) => {
+    if (!url || pdfLinks.some((p) => p.url === url)) return;
+    pdfLinks.push({ url, parentRecordUrl, title, snippet });
+  };
 
   await Promise.all([
+    // 1. US CourtListener Direct HTML
     (async () => {
       try {
         const clUrl = `https://www.courtlistener.com/?q=${encodeURIComponent(`"${fullName}"`)}`;
@@ -3600,6 +3729,7 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
             source: "CourtListener",
             snippet: textClean.slice(0, 180),
             kind: "record",
+            record_type: "Legal / Court Record",
           });
           count++;
           if (count >= (depthLevel >= 3 ? 4 : 2)) break;
@@ -3609,6 +3739,7 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
       }
     })(),
 
+    // 2. arXiv Academic Author Search Direct HTML
     (async () => {
       try {
         const axUrl = `https://arxiv.org/search/?query=${encodeURIComponent(fullName)}&searchtype=author&abstracts=show&order=-announced_date_first&size=25`;
@@ -3634,15 +3765,138 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
             source: "arXiv Research",
             snippet: authorsTxt.slice(0, 160),
             kind: "record",
+            record_type: "Academic Publication",
           });
-          if (pdfM && !pdfLinks.some((p) => p.url === pdfM[1])) {
-            pdfLinks.push({ url: pdfM[1], parentRecordUrl: url });
+          if (pdfM) {
+            addPdfLink(pdfM[1], url, title, authorsTxt.slice(0, 180));
           }
           count++;
           if (count >= (depthLevel >= 3 ? 5 : 3)) break;
         }
       } catch {
         // ignore
+      }
+    })(),
+
+    // 3. IndianKanoon Direct HTML Legal / Court Records
+    (async () => {
+      try {
+        const ikUrl = `https://indiankanoon.org/search/?formInput=${encodeURIComponent(`"${fullName}"`)}`;
+        const r = await sovereignFetch(
+          ikUrl,
+          { maxBytes: 280_000, jitter: false, socksUser: nextPrSocksUser() },
+          netCtx,
+          12000
+        );
+        if (!r.ok) return;
+        const html = await r.text();
+        const chunks = html.split(/<div\b[^>]*class=["'][^"']*result_title[^"']*["'][^>]*>/i).slice(1);
+        let count = 0;
+        for (const blk of chunks) {
+          const aM = blk.match(/<a\b[^>]*href=["'](\/(?:doc|docfragment)\/\d+[^"']*)["'][^>]*>([\s\S]*?)<\/a>/i);
+          if (!aM) continue;
+          const title = decodeHtmlEntities(aM[2].replace(/<[^>]+>/g, " "));
+          const snM = blk.match(/<div\b[^>]*class=["'][^"']*headline[^"']*["'][^>]*>([\s\S]*?)<\/div>/i);
+          const snippet = snM ? decodeHtmlEntities(snM[1].replace(/<[^>]+>/g, " ")) : title;
+          if (!hasFullNameMatch(`${title} ${snippet}`, fullName)) continue;
+          const docPath = aM[1].replace(/^\/docfragment\//i, "/doc/").split("?")[0];
+          const url = `https://indiankanoon.org${docPath}`;
+          if (seen.has(url)) continue;
+          seen.add(url);
+          records.push({
+            title: title.slice(0, 110),
+            url,
+            source: "IndianKanoon",
+            snippet: snippet.slice(0, 200),
+            kind: "record",
+            record_type: "Legal / Court Record",
+          });
+          count++;
+          if (count >= (depthLevel >= 3 ? 4 : 2)) break;
+        }
+      } catch {
+        // ignore
+      }
+    })(),
+
+    // 4. Global Corporate, Directorship, LLP & Registry Filings (Startpage over Tor with 3-circuit retry)
+    (async () => {
+      const corpQuery = `"${fullName}" (director OR LLP OR CIN OR DIN OR "Form MGT-7" OR "annual return" OR "founder" OR "managing director" OR "CEO" OR site:falconebiz.com OR site:zaubacorp.com OR site:tofler.in OR site:opencorporates.com OR site:thecompanycheck.com OR site:companieshouse.gov.uk)`;
+      const spRes = await queryStartpageWithRetry(corpQuery, netCtx, nextPrSocksUser, 15000);
+      if (!spRes.ok) return;
+      let count = 0;
+      for (const item of spRes.items.slice(0, 10)) {
+        if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
+        const fullMatch =
+          hasFullNameMatch(`${item.title} ${item.snippet}`, fullName) ||
+          (hasFullNameMatch(item.url, fullName) && sharesNameToken(`${item.title} ${item.snippet}`, fullName));
+        if (!fullMatch) continue;
+        if (/\.pdf(?:$|[?#])/i.test(item.url) || item.url.toLowerCase().includes(".pdf")) {
+          addPdfLink(item.url, null, item.title, item.snippet);
+          continue;
+        }
+        let host = "";
+        try {
+          host = new URL(item.url).hostname.replace(/^www\./, "").toLowerCase();
+        } catch {
+          host = "registry";
+        }
+        if (/(?:^|\.)(?:instagram\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|threads\.net)$/i.test(host)) {
+          continue;
+        }
+        if (seen.has(item.url)) continue;
+        seen.add(item.url);
+        records.push({
+          title: item.title.slice(0, 110),
+          url: item.url,
+          source: host,
+          snippet: item.snippet.slice(0, 220),
+          kind: "record",
+          record_type: "Corporate Filing",
+        });
+        count++;
+        if (count >= (depthLevel >= 3 ? 6 : 4)) break;
+      }
+    })(),
+
+    // 5. Global Legal, Regulatory, Patent & Academic/Public Document Discovery (Startpage over Tor)
+    (async () => {
+      const docQuery = `"${fullName}" (court OR judgment OR docket OR tribunal OR gazette OR patent OR publication OR thesis OR scribd OR researchgate OR "executive summary" OR filetype:pdf)`;
+      const spRes = await queryStartpageWithRetry(docQuery, netCtx, nextPrSocksUser, 15000);
+      if (!spRes.ok) return;
+      let count = 0;
+      for (const item of spRes.items.slice(0, 10)) {
+        if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
+        const fullMatch =
+          hasFullNameMatch(`${item.title} ${item.snippet}`, fullName) ||
+          (hasFullNameMatch(item.url, fullName) && sharesNameToken(`${item.title} ${item.snippet}`, fullName));
+        if (!fullMatch) continue;
+        if (/\.pdf(?:$|[?#])/i.test(item.url) || item.url.toLowerCase().includes(".pdf")) {
+          addPdfLink(item.url, null, item.title, item.snippet);
+          continue;
+        }
+        let host = "";
+        try {
+          host = new URL(item.url).hostname.replace(/^www\./, "").toLowerCase();
+        } catch {
+          host = "public-doc";
+        }
+        if (/(?:^|\.)(?:instagram\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|threads\.net)$/i.test(host)) {
+          continue;
+        }
+        if (seen.has(item.url)) continue;
+        seen.add(item.url);
+        const recType = inferRecordType(item.url, item.title, item.snippet, "Academic Publication");
+        records.push({
+          title: item.title.slice(0, 110),
+          url: item.url,
+          source: host,
+          snippet: item.snippet.slice(0, 220),
+          kind: "record",
+          record_type: recType,
+        });
+        count++;
+        if (count >= (depthLevel >= 3 ? 6 : 4)) break;
       }
     })(),
   ]);
@@ -4364,9 +4618,10 @@ async function runInvestigation(caseId, input, auth) {
   // -------------------------------------------------------------------------
   emitStage("web_social", "Searching public social profiles, media, legal & academic records", 14);
   emitTool("web-social", "running", 0, "YouTube, Wikipedia & multi-engine social/web cascade");
-  emitTool("public-records", "running", 0, "CourtListener legal & arXiv academic records");
+  emitTool("public-records", "running", 0, "Global corporate filings, legal/court & academic records");
 
   const webDiscoveredPdfs = [];
+  const pdfMetaMap = new Map(); // pdfUrl -> { title, snippet, parentRecordId, verifiedFromSearch }
   const webDiscoveredSites = [];
   const verifiedHandlesPriority = [];
 
@@ -4505,6 +4760,9 @@ async function runInvestigation(caseId, input, auth) {
   }
   for (const rec of socialWebRes.records) {
     const recId = normalizeNodeId("record", rec.url);
+    const recType =
+      rec.record_type ||
+      inferRecordType(rec.url, rec.title, rec.snippet, rec.source === "YouTube Media" ? "Media / Talk" : "Public Web Record");
     addNode({
       id: recId,
       kind: "record",
@@ -4516,6 +4774,7 @@ async function runInvestigation(caseId, input, auth) {
       sources: ["web-social"],
       metadata: {
         source: rec.source,
+        record_type: recType,
         bio: rec.snippet,
         match_tier: "verified",
         match_reason: `${rec.source} match for full name`,
@@ -4546,36 +4805,85 @@ async function runInvestigation(caseId, input, auth) {
   for (const wObj of socialWebRes.websites) {
     const u = typeof wObj === "string" ? wObj : wObj.url;
     const srcUrl = typeof wObj === "string" ? null : wObj.sourceUrl;
-    if (u && !webDiscoveredSites.includes(u)) webDiscoveredSites.push(u);
-    if (u && srcUrl) {
-      const parentRecId = normalizeNodeId("record", srcUrl);
-      pageParentMap.set(u, parentRecId);
-      try {
-        const dom = new URL(u).hostname.replace(/^www\./, "").toLowerCase();
-        if (dom && !PLATFORM_NOISE_DOMAINS.some((d) => dom === d || dom.endsWith(`.${d}`))) {
-          domainParentMap.set(dom, { parentId: parentRecId, relation: "links_to" });
-          if (!seenDomains.has(dom)) {
-            seenDomains.add(dom);
-            knownDomains.push(dom);
-          }
+    const wTitle = typeof wObj === "string" ? null : wObj.title;
+    const wSnippet = typeof wObj === "string" ? null : wObj.snippet;
+    if (!u) continue;
+    if (!webDiscoveredSites.includes(u)) webDiscoveredSites.push(u);
+    try {
+      const dom = new URL(u).hostname.replace(/^www\./, "").toLowerCase();
+      let parentId = srcUrl ? normalizeNodeId("record", srcUrl) : normalizeNodeId("record", u);
+      if (!srcUrl && !snap.nodes.some((n) => n.id === parentId)) {
+        addNode({
+          id: parentId,
+          kind: "record",
+          label: (wTitle || dom).slice(0, 68),
+          sublabel: dom,
+          layer: "anchor",
+          confidence: 0.82,
+          status: "unverified",
+          sources: ["web-social"],
+          metadata: {
+            source: dom,
+            record_type: "Personal / Company Website",
+            bio: wSnippet || `Personal or company website linked to ${fullName}`,
+            match_tier: "verified",
+            match_reason: `${dom} website matched full name`,
+          },
+          url: u,
+          depth: 1,
+        });
+        if (!hasParentEdge(parentId)) {
+          addEdge(seedId, parentId, "public_record", 0.82, "web-social");
         }
-      } catch {
-        // ignore invalid URL
       }
+      pageParentMap.set(u, parentId);
+      if (dom && !PLATFORM_NOISE_DOMAINS.some((d) => dom === d || dom.endsWith(`.${d}`))) {
+        if (!domainParentMap.has(dom)) {
+          domainParentMap.set(dom, { parentId, relation: "links_to" });
+        }
+        if (!seenDomains.has(dom)) {
+          seenDomains.add(dom);
+          knownDomains.push(dom);
+        }
+      }
+    } catch {
+      // ignore invalid URL
     }
   }
   for (const pObj of socialWebRes.pdfs) {
     const pUrl = typeof pObj === "string" ? pObj : pObj.url;
     const srcUrl = typeof pObj === "string" ? null : pObj.sourceUrl;
     if (pUrl && !webDiscoveredPdfs.includes(pUrl)) webDiscoveredPdfs.push(pUrl);
-    if (pUrl && srcUrl) {
-      pdfParentMap.set(pUrl, { parentId: normalizeNodeId("record", srcUrl), relation: "linked_pdf" });
+    if (pUrl) {
+      const parentRecId = srcUrl ? normalizeNodeId("record", srcUrl) : null;
+      if (parentRecId) {
+        pdfParentMap.set(pUrl, { parentId: parentRecId, relation: "linked_pdf" });
+      }
+      if (!pdfMetaMap.has(pUrl)) {
+        pdfMetaMap.set(pUrl, {
+          title: typeof pObj === "string" ? null : pObj.title || null,
+          snippet: typeof pObj === "string" ? null : pObj.snippet || null,
+          parentRecordId: parentRecId,
+          verifiedFromSearch: true,
+        });
+      }
     }
   }
   for (const pLink of pubRecordsRes.pdfLinks || []) {
     if (pLink.url && !webDiscoveredPdfs.includes(pLink.url)) webDiscoveredPdfs.push(pLink.url);
-    if (pLink.url && pLink.parentRecordUrl) {
-      pdfParentMap.set(pLink.url, { parentId: normalizeNodeId("record", pLink.parentRecordUrl), relation: "has_pdf" });
+    if (pLink.url) {
+      const parentRecId = pLink.parentRecordUrl ? normalizeNodeId("record", pLink.parentRecordUrl) : null;
+      if (parentRecId) {
+        pdfParentMap.set(pLink.url, { parentId: parentRecId, relation: "has_pdf" });
+      }
+      if (!pdfMetaMap.has(pLink.url)) {
+        pdfMetaMap.set(pLink.url, {
+          title: pLink.title || null,
+          snippet: pLink.snippet || null,
+          parentRecordId: parentRecId,
+          verifiedFromSearch: true,
+        });
+      }
     }
   }
 
@@ -4595,6 +4903,7 @@ async function runInvestigation(caseId, input, auth) {
   let pubRecHits = 0;
   for (const rec of pubRecordsRes.records) {
     const recId = normalizeNodeId("record", rec.url);
+    const recType = rec.record_type || inferRecordType(rec.url, rec.title, rec.snippet, "Public Web Record");
     addNode({
       id: recId,
       kind: "record",
@@ -4606,6 +4915,7 @@ async function runInvestigation(caseId, input, auth) {
       sources: ["public-records"],
       metadata: {
         source: rec.source,
+        record_type: recType,
         bio: rec.snippet,
         match_tier: "verified",
         match_reason: `${rec.source} public record`,
@@ -4621,7 +4931,7 @@ async function runInvestigation(caseId, input, auth) {
       node_id: recId,
       title: `${rec.source}: ${rec.title}`,
       category: "corporate",
-      severity: rec.source === "CourtListener" ? "medium" : "low",
+      severity: recType === "Legal / Court Record" ? "medium" : "low",
       confidence: 0.84,
       consensus_count: 1,
       sources: ["public-records"],
@@ -4637,7 +4947,7 @@ async function runInvestigation(caseId, input, auth) {
     "public-records",
     depthLevel >= 2 ? "done" : "skipped",
     pubRecHits,
-    depthLevel >= 2 ? `${pubRecHits} legal/academic record(s), ${(pubRecordsRes.pdfLinks || []).length} PDF(s)` : "Quick depth (L1)"
+    depthLevel >= 2 ? `${pubRecHits} corporate/legal/academic record(s), ${(pubRecordsRes.pdfLinks || []).length} PDF(s)` : "Quick depth (L1)"
   );
 
   // -------------------------------------------------------------------------
@@ -5945,20 +6255,48 @@ async function runInvestigation(caseId, input, auth) {
   let docHits = 0;
   if (docPdfCap > 0) {
     for (const pdfUrl of discoveredPdfUrls.slice(0, docPdfCap)) {
+      const searchMeta = pdfMetaMap.get(pdfUrl) || null;
       const meta = await fetchAndParsePdf(pdfUrl, netCtx);
-      if (!meta) continue;
       const pInfo = pdfParentMap.get(pdfUrl);
       const isArxivPdf = pInfo?.relation === "has_pdf";
-      if (!isArxivPdf && !meta.author && !meta.creator && !meta.internal_usernames.length && !meta.emails.length && !meta.phones?.length) {
+      const isSearchVerified = Boolean(searchMeta?.verifiedFromSearch);
+      if (!meta && !isSearchVerified) continue;
+      if (
+        meta &&
+        !isArxivPdf &&
+        !isSearchVerified &&
+        !meta.author &&
+        !meta.creator &&
+        !meta.internal_usernames.length &&
+        !meta.emails.length &&
+        !meta.phones?.length
+      ) {
         continue;
       }
-      const docId = normalizeNodeId("document", meta.url);
-      const authorMatch = meta.author && sharesNameToken(meta.author, fullName);
-      const conf = authorMatch || meta.emails.length || meta.phones?.length ? 0.86 : isArxivPdf ? 0.82 : 0.74;
+      let fallbackFileName = "document.pdf";
+      try {
+        const seg = decodeURIComponent(new URL(pdfUrl).pathname.split("/").filter(Boolean).pop() || "");
+        if (seg) fallbackFileName = seg.slice(0, 80);
+      } catch {
+        // ignore
+      }
+      const fileName = meta?.file_name || fallbackFileName;
+      const docTitle = (searchMeta?.title || meta?.title || fileName).slice(0, 120);
+      const docBio = searchMeta?.snippet || null;
+      const docId = normalizeNodeId("document", pdfUrl);
+      const authorMatch = Boolean(meta?.author && sharesNameToken(meta.author, fullName));
+      const conf =
+        authorMatch || meta?.emails?.length || meta?.phones?.length
+          ? 0.86
+          : isArxivPdf || isSearchVerified
+          ? 0.82
+          : 0.74;
       const fallbackDomId = corpDomains[0] ? normalizeNodeId("domain", corpDomains[0]) : seedId;
       const parentId =
         pInfo?.parentId && snap.nodes.some((n) => n.id === pInfo.parentId)
           ? pInfo.parentId
+          : searchMeta?.parentRecordId && snap.nodes.some((n) => n.id === searchMeta.parentRecordId)
+          ? searchMeta.parentRecordId
           : snap.nodes.some((n) => n.id === fallbackDomId)
           ? fallbackDomId
           : seedId;
@@ -5968,48 +6306,58 @@ async function runInvestigation(caseId, input, auth) {
       addNode({
         id: docId,
         kind: "document",
-        label: meta.file_name,
-        sublabel: meta.author || meta.creator || meta.producer || "Public PDF Metadata",
-        layer: authorMatch ? "anchor" : "deep",
+        label: docTitle.slice(0, 68),
+        sublabel: meta?.author || meta?.creator || meta?.producer || (isSearchVerified ? "Verified Public PDF" : "Public PDF Metadata"),
+        layer: authorMatch || isSearchVerified ? "anchor" : "deep",
         confidence: conf,
         status: "unverified",
         sources: ["doc-meta"],
         metadata: {
-          filename: meta.file_name,
-          match_tier: authorMatch || meta.emails.length || isArxivPdf ? "verified" : "probable",
-          match_reason: authorMatch ? "PDF /Author matches target" : isArxivPdf ? "Academic paper PDF" : "Public PDF Info/XMP metadata",
-          ...(meta.author ? { author: meta.author } : {}),
-          ...(meta.creator ? { creator: meta.creator } : {}),
-          ...(meta.producer ? { producer: meta.producer } : {}),
-          ...(meta.internal_usernames.length ? { os_user: meta.internal_usernames.join(", ") } : {}),
-          ...(meta.emails.length ? { extracted_emails: meta.emails.join(", ") } : {}),
+          filename: fileName,
+          title: docTitle,
+          ...(docBio ? { bio: docBio } : {}),
+          match_tier: authorMatch || meta?.emails?.length || isArxivPdf || isSearchVerified ? "verified" : "probable",
+          match_reason: authorMatch
+            ? "PDF /Author matches target"
+            : isArxivPdf
+            ? "Academic paper PDF"
+            : isSearchVerified
+            ? "Public PDF verified in search index"
+            : "Public PDF Info/XMP metadata",
+          ...(meta?.author ? { author: meta.author } : {}),
+          ...(meta?.creator ? { creator: meta.creator } : {}),
+          ...(meta?.producer ? { producer: meta.producer } : {}),
+          ...(meta?.internal_usernames?.length ? { os_user: meta.internal_usernames.join(", ") } : {}),
+          ...(meta?.emails?.length ? { extracted_emails: meta.emails.join(", ") } : {}),
         },
-        url: meta.url,
+        url: pdfUrl,
         depth: docDepth,
       });
       addEdge(parentId, docId, docRel, conf, "doc-meta");
       const details = [
-        meta.author && `Author: ${meta.author}`,
-        meta.creator && `Creator: ${meta.creator}`,
-        meta.producer && `Producer: ${meta.producer}`,
+        meta?.author && `Author: ${meta.author}`,
+        meta?.creator && `Creator: ${meta.creator}`,
+        meta?.producer && `Producer: ${meta.producer}`,
       ].filter(Boolean);
       addFinding({
         id: `finding:pdf:${docId}`,
         node_id: docId,
-        title: `Public PDF Document: ${meta.file_name}`,
+        title: `Public PDF Document: ${docTitle}`,
         category: "corporate",
-        severity: authorMatch || meta.internal_usernames.length ? "medium" : "low",
+        severity: authorMatch || meta?.internal_usernames?.length ? "medium" : "low",
         confidence: conf,
         consensus_count: 1,
         sources: ["doc-meta"],
-        summary: `PDF parser extracted ${details.join(" · ") || "embedded path/contact indicators"} from ${meta.file_name}.`,
-        pivot_trail: [`Name: ${fullName}`, `Public PDF -> ${meta.file_name}`, details[0] || "PDF Info/XMP"],
-        url: meta.url,
+        summary: details.length
+          ? `PDF parser extracted ${details.join(" · ")} from ${fileName}.${docBio ? ` ${docBio}` : ""}`
+          : docBio || `Verified public PDF document ${fileName} linked to ${fullName}.`,
+        pivot_trail: [`Name: ${fullName}`, `Public PDF -> ${fileName}`, details[0] || "Search-Verified PDF"],
+        url: pdfUrl,
         timestamp: now,
-        sensitive_fields: meta.author ? [meta.author] : [],
+        sensitive_fields: meta?.author ? [meta.author] : [],
       });
       docHits++;
-      for (const u of meta.internal_usernames) {
+      for (const u of meta?.internal_usernames || []) {
         const uId = normalizeNodeId("handle", u);
         addNode({
           id: uId,
@@ -6021,14 +6369,14 @@ async function runInvestigation(caseId, input, auth) {
           status: "unverified",
           sources: ["doc-meta"],
           metadata: { handle: u, match_tier: "verified", match_reason: "PDF internal file path username" },
-          url: meta.url,
+          url: pdfUrl,
           depth: docDepth + 1,
         });
         addEdge(docId, uId, "leaked_os_user", 0.82, "doc-meta");
         trackHandle(u);
         docHits++;
       }
-      for (const em of meta.emails) {
+      for (const em of meta?.emails || []) {
         const emId = normalizeNodeId("email", em);
         addNode({
           id: emId,
@@ -6040,14 +6388,14 @@ async function runInvestigation(caseId, input, auth) {
           status: "unverified",
           sources: ["doc-meta"],
           metadata: { match_tier: "verified", match_reason: "Embedded PDF email" },
-          url: meta.url,
+          url: pdfUrl,
           depth: docDepth + 1,
         });
         addEdge(docId, emId, "pdf_author_email", 0.86, "doc-meta");
         trackEmail(em);
         docHits++;
       }
-      for (const ph of meta.phones || []) {
+      for (const ph of meta?.phones || []) {
         if (trackPhone(ph)) {
           const phId = normalizeNodeId("phone", ph);
           addNode({
@@ -6060,7 +6408,7 @@ async function runInvestigation(caseId, input, auth) {
             status: "unverified",
             sources: ["doc-meta"],
             metadata: { match_tier: "verified", match_reason: "Extracted from public PDF" },
-            url: meta.url,
+            url: pdfUrl,
             depth: docDepth + 1,
           });
           addEdge(docId, phId, "pdf_phone", 0.84, "doc-meta");

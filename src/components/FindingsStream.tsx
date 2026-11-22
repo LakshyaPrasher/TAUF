@@ -919,50 +919,74 @@ export function FindingsStream({
 
               {intel.documents.length > 0 ? (
                 <div className="compact-rows">
-                  {intel.documents.map((doc) => (
-                    <div
-                      key={doc.key}
-                      className={`compact-row ${
-                        selectedNodeId === doc.nodeId ? "is-selected" : ""
-                      }`}
-                      onClick={() => onSelectNode(doc.nodeId)}
-                    >
-                      <div className="compact-row-head">
-                        <span className="compact-row-title doc-title">
-                          <FileText size={13} strokeWidth={1.5} />
-                          <span>{doc.filename}</span>
-                        </span>
-                        {doc.url && (
-                          <a
-                            href={doc.url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="card-icon-btn"
-                            onClick={(e) => e.stopPropagation()}
-                            title="Open document"
-                          >
-                            <ExternalLink size={12} strokeWidth={1.5} />
-                          </a>
+                  {intel.documents.map((doc) => {
+                    const heading = doc.title || doc.filename;
+                    const showFilenameSub =
+                      Boolean(doc.title) &&
+                      doc.title!.toLowerCase() !== doc.filename.toLowerCase();
+                    const hasMeta =
+                      showFilenameSub ||
+                      Boolean(doc.author) ||
+                      Boolean(doc.creator) ||
+                      Boolean(doc.leakedPathUser) ||
+                      Boolean(doc.extractedContacts);
+                    return (
+                      <div
+                        key={doc.key}
+                        className={`compact-row ${
+                          selectedNodeId === doc.nodeId ? "is-selected" : ""
+                        }`}
+                        onClick={() => onSelectNode(doc.nodeId)}
+                      >
+                        <div className="compact-row-head">
+                          <span className="compact-row-title doc-title">
+                            <FileText size={13} strokeWidth={1.5} />
+                            <span>{redactText(heading, redact)}</span>
+                          </span>
+                          {doc.url && (
+                            <a
+                              href={doc.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="card-icon-btn"
+                              onClick={(e) => e.stopPropagation()}
+                              title="Open document"
+                            >
+                              <ExternalLink size={12} strokeWidth={1.5} />
+                            </a>
+                          )}
+                        </div>
+                        {hasMeta && (
+                          <div className="compact-row-meta">
+                            {showFilenameSub && (
+                              <span className="mono">{doc.filename}</span>
+                            )}
+                            {doc.author && (
+                              <span>
+                                Author: {redactText(doc.author, redact)}
+                              </span>
+                            )}
+                            {doc.creator && <span>Software: {doc.creator}</span>}
+                            {doc.leakedPathUser && (
+                              <span className="posture-warn">
+                                OS user: {redactText(doc.leakedPathUser, redact)}
+                              </span>
+                            )}
+                            {doc.extractedContacts && (
+                              <span className="mono">
+                                {redactText(doc.extractedContacts, redact)}
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        {doc.bio && (
+                          <p className="compact-excerpt">
+                            {redactText(doc.bio, redact)}
+                          </p>
                         )}
                       </div>
-                      <div className="compact-row-meta">
-                        {doc.author && (
-                          <span>Author: {redactText(doc.author, redact)}</span>
-                        )}
-                        {doc.creator && <span>Software: {doc.creator}</span>}
-                        {doc.leakedPathUser && (
-                          <span className="posture-warn">
-                            OS user: {redactText(doc.leakedPathUser, redact)}
-                          </span>
-                        )}
-                        {doc.extractedContacts && (
-                          <span className="mono">
-                            {redactText(doc.extractedContacts, redact)}
-                          </span>
-                        )}
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               ) : (
                 <p className="block-empty">
