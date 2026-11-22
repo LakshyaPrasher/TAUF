@@ -1,0 +1,26 @@
+# Dependencies & virtual environments
+node_modules/
+sidecar/.venv/
+
+# Python bytecode & caches
+sidecar/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+dist/
+src-tauri/target/
+
+# Runtime & tool outputs
+reports/
+*.log
+output_*.txt
+
+# Environment & secrets
+.env
+.env.*
+
+# OS metadata
+.DS_Store
+Thumbs.db

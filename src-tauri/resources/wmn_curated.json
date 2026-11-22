@@ -1,0 +1,705 @@
+{
+  "license": "CC-BY-SA-4.0 (Curated direct-HTML subset inspired by WebBreacher/WhatsMyName — zero external API endpoints)",
+  "sites": [
+    {
+      "name": "GitHub",
+      "category": "code",
+      "uri_check": "https://github.com/{account}",
+      "uri_pretty": "https://github.com/{account}",
+      "e_code": 200,
+      "e_string": "og:title",
+      "m_string": "Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "GitLab",
+      "category": "code",
+      "uri_check": "https://gitlab.com/{account}",
+      "uri_pretty": "https://gitlab.com/{account}",
+      "e_code": 200,
+      "e_string": "GitLab",
+      "m_string": "The page could not be found",
+      "m_code": 404
+    },
+    {
+      "name": "Keybase",
+      "category": "code",
+      "uri_check": "https://keybase.io/{account}",
+      "uri_pretty": "https://keybase.io/{account}",
+      "e_code": 200,
+      "e_string": "keybase.io",
+      "m_string": "No user found",
+      "m_code": 404
+    },
+    {
+      "name": "HackerNews",
+      "category": "code",
+      "uri_check": "https://news.ycombinator.com/user?id={account}",
+      "uri_pretty": "https://news.ycombinator.com/user?id={account}",
+      "e_code": 200,
+      "e_string": "created:",
+      "m_string": "No such user.",
+      "m_code": 404
+    },
+    {
+      "name": "Reddit",
+      "category": "account",
+      "uri_check": "https://old.reddit.com/user/{account}",
+      "uri_pretty": "https://www.reddit.com/user/{account}",
+      "e_code": 200,
+      "e_string": "overview for",
+      "m_string": "page not found",
+      "m_code": 404
+    },
+    {
+      "name": "PyPI",
+      "category": "code",
+      "uri_check": "https://pypi.org/user/{account}/",
+      "uri_pretty": "https://pypi.org/user/{account}/",
+      "e_code": 200,
+      "e_string": "Profile of",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "npm",
+      "category": "code",
+      "uri_check": "https://www.npmjs.com/~{account}",
+      "uri_pretty": "https://www.npmjs.com/~{account}",
+      "e_code": 200,
+      "e_string": "npmjs.com",
+      "m_string": "Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "DockerHub",
+      "category": "code",
+      "uri_check": "https://hub.docker.com/u/{account}",
+      "uri_pretty": "https://hub.docker.com/u/{account}",
+      "e_code": 200,
+      "e_string": "Docker",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "HuggingFace",
+      "category": "code",
+      "uri_check": "https://huggingface.co/{account}",
+      "uri_pretty": "https://huggingface.co/{account}",
+      "e_code": 200,
+      "e_string": "Hugging Face",
+      "m_string": "Sorry, we can't find the page",
+      "m_code": 404
+    },
+    {
+      "name": "Bitbucket",
+      "category": "code",
+      "uri_check": "https://bitbucket.org/{account}/",
+      "uri_pretty": "https://bitbucket.org/{account}/",
+      "e_code": 200,
+      "e_string": "Bitbucket",
+      "m_string": "Resource not found",
+      "m_code": 404
+    },
+    {
+      "name": "Dev.to",
+      "category": "code",
+      "uri_check": "https://dev.to/{account}",
+      "uri_pretty": "https://dev.to/{account}",
+      "e_code": 200,
+      "e_string": "DEV Community",
+      "m_string": "This page does not exist",
+      "m_code": 404
+    },
+    {
+      "name": "Medium",
+      "category": "account",
+      "uri_check": "https://medium.com/@{account}",
+      "uri_pretty": "https://medium.com/@{account}",
+      "e_code": 200,
+      "e_string": "og:title",
+      "m_string": "PAGE NOT FOUND",
+      "m_code": 404
+    },
+    {
+      "name": "Mastodon.social",
+      "category": "account",
+      "uri_check": "https://mastodon.social/@{account}",
+      "uri_pretty": "https://mastodon.social/@{account}",
+      "e_code": 200,
+      "e_string": "mastodon.social",
+      "m_string": "The page you are looking for isn't here",
+      "m_code": 404
+    },
+    {
+      "name": "Infosec.exchange",
+      "category": "account",
+      "uri_check": "https://infosec.exchange/@{account}",
+      "uri_pretty": "https://infosec.exchange/@{account}",
+      "e_code": 200,
+      "e_string": "infosec.exchange",
+      "m_string": "The page you are looking for isn't here",
+      "m_code": 404
+    },
+    {
+      "name": "HackerOne",
+      "category": "code",
+      "uri_check": "https://hackerone.com/{account}",
+      "uri_pretty": "https://hackerone.com/{account}",
+      "e_code": 200,
+      "e_string": "HackerOne",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "Bugcrowd",
+      "category": "code",
+      "uri_check": "https://bugcrowd.com/{account}",
+      "uri_pretty": "https://bugcrowd.com/{account}",
+      "e_code": 200,
+      "e_string": "bugcrowd",
+      "m_string": "The page you were looking for doesn't exist",
+      "m_code": 404
+    },
+    {
+      "name": "Kaggle",
+      "category": "code",
+      "uri_check": "https://www.kaggle.com/{account}",
+      "uri_pretty": "https://www.kaggle.com/{account}",
+      "e_code": 200,
+      "e_string": "Kaggle",
+      "m_string": "We can't find that page",
+      "m_code": 404
+    },
+    {
+      "name": "CodePen",
+      "category": "code",
+      "uri_check": "https://codepen.io/{account}",
+      "uri_pretty": "https://codepen.io/{account}",
+      "e_code": 200,
+      "e_string": "CodePen",
+      "m_string": "404",
+      "m_code": 404
+    },
+    {
+      "name": "Replit",
+      "category": "code",
+      "uri_check": "https://replit.com/@{account}",
+      "uri_pretty": "https://replit.com/@{account}",
+      "e_code": 200,
+      "e_string": "Replit",
+      "m_string": "Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Launchpad",
+      "category": "code",
+      "uri_check": "https://launchpad.net/~{account}",
+      "uri_pretty": "https://launchpad.net/~{account}",
+      "e_code": 200,
+      "e_string": "Launchpad",
+      "m_string": "There is no page with this address",
+      "m_code": 404
+    },
+    {
+      "name": "SourceForge",
+      "category": "code",
+      "uri_check": "https://sourceforge.net/u/{account}/profile/",
+      "uri_pretty": "https://sourceforge.net/u/{account}/profile/",
+      "e_code": 200,
+      "e_string": "SourceForge",
+      "m_string": "Whoops, we can't find that page",
+      "m_code": 404
+    },
+    {
+      "name": "Codeberg",
+      "category": "code",
+      "uri_check": "https://codeberg.org/{account}",
+      "uri_pretty": "https://codeberg.org/{account}",
+      "e_code": 200,
+      "e_string": "Codeberg",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "RubyGems",
+      "category": "code",
+      "uri_check": "https://rubygems.org/profiles/{account}",
+      "uri_pretty": "https://rubygems.org/profiles/{account}",
+      "e_code": 200,
+      "e_string": "rubygems.org",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "NuGet",
+      "category": "code",
+      "uri_check": "https://www.nuget.org/profiles/{account}",
+      "uri_pretty": "https://www.nuget.org/profiles/{account}",
+      "e_code": 200,
+      "e_string": "NuGet Gallery",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "SpeakerDeck",
+      "category": "corporate",
+      "uri_check": "https://speakerdeck.com/{account}",
+      "uri_pretty": "https://speakerdeck.com/{account}",
+      "e_code": 200,
+      "e_string": "Speaker Deck",
+      "m_string": "The page you were looking for doesn't exist",
+      "m_code": 404
+    },
+    {
+      "name": "ProductHunt",
+      "category": "corporate",
+      "uri_check": "https://www.producthunt.com/@{account}",
+      "uri_pretty": "https://www.producthunt.com/@{account}",
+      "e_code": 200,
+      "e_string": "Product Hunt",
+      "m_string": "We seem to have lost this page",
+      "m_code": 404
+    },
+    {
+      "name": "About.me",
+      "category": "account",
+      "uri_check": "https://about.me/{account}",
+      "uri_pretty": "https://about.me/{account}",
+      "e_code": 200,
+      "e_string": "about.me",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "Telegram",
+      "category": "account",
+      "uri_check": "https://t.me/{account}",
+      "uri_pretty": "https://t.me/{account}",
+      "e_code": 200,
+      "e_string": "tgme_page_title",
+      "m_string": "If you have <strong>Telegram</strong>, you can contact <a",
+      "m_code": 404
+    },
+    {
+      "name": "YouTube",
+      "category": "account",
+      "uri_check": "https://www.youtube.com/@{account}",
+      "uri_pretty": "https://www.youtube.com/@{account}",
+      "e_code": 200,
+      "e_string": "youtube.com/@",
+      "m_string": "This page isn't available",
+      "m_code": 404
+    },
+    {
+      "name": "Vimeo",
+      "category": "account",
+      "uri_check": "https://vimeo.com/{account}",
+      "uri_pretty": "https://vimeo.com/{account}",
+      "e_code": 200,
+      "e_string": "vimeo.com",
+      "m_string": "Sorry, we couldn't find that page",
+      "m_code": 404
+    },
+    {
+      "name": "Behance",
+      "category": "account",
+      "uri_check": "https://www.behance.net/{account}",
+      "uri_pretty": "https://www.behance.net/{account}",
+      "e_code": 200,
+      "e_string": "Behance",
+      "m_string": "Oops! We can't find that page",
+      "m_code": 404
+    },
+    {
+      "name": "Dribbble",
+      "category": "account",
+      "uri_check": "https://dribbble.com/{account}",
+      "uri_pretty": "https://dribbble.com/{account}",
+      "e_code": 200,
+      "e_string": "Dribbble",
+      "m_string": "Whoops, that page is gone",
+      "m_code": 404
+    },
+    {
+      "name": "Flickr",
+      "category": "account",
+      "uri_check": "https://www.flickr.com/people/{account}/",
+      "uri_pretty": "https://www.flickr.com/people/{account}/",
+      "e_code": 200,
+      "e_string": "Flickr",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Patreon",
+      "category": "account",
+      "uri_check": "https://www.patreon.com/{account}",
+      "uri_pretty": "https://www.patreon.com/{account}",
+      "e_code": 200,
+      "e_string": "Patreon",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Goodreads",
+      "category": "account",
+      "uri_check": "https://www.goodreads.com/{account}",
+      "uri_pretty": "https://www.goodreads.com/{account}",
+      "e_code": 200,
+      "e_string": "Goodreads",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "Letterboxd",
+      "category": "account",
+      "uri_check": "https://letterboxd.com/{account}/",
+      "uri_pretty": "https://letterboxd.com/{account}/",
+      "e_code": 200,
+      "e_string": "Letterboxd",
+      "m_string": "Sorry, we can't find the page you've requested",
+      "m_code": 404
+    },
+    {
+      "name": "Chess.com",
+      "category": "account",
+      "uri_check": "https://www.chess.com/member/{account}",
+      "uri_pretty": "https://www.chess.com/member/{account}",
+      "e_code": 200,
+      "e_string": "chess.com",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Lichess",
+      "category": "account",
+      "uri_check": "https://lichess.org/@/{account}",
+      "uri_pretty": "https://lichess.org/@/{account}",
+      "e_code": 200,
+      "e_string": "lichess.org",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "Pastebin",
+      "category": "code",
+      "uri_check": "https://pastebin.com/u/{account}",
+      "uri_pretty": "https://pastebin.com/u/{account}",
+      "e_code": 200,
+      "e_string": "Pastebin",
+      "m_string": "Not Found (#404)",
+      "m_code": 404
+    },
+    {
+      "name": "Steam",
+      "category": "account",
+      "uri_check": "https://steamcommunity.com/id/{account}",
+      "uri_pretty": "https://steamcommunity.com/id/{account}",
+      "e_code": 200,
+      "e_string": "actual_persona_name",
+      "m_string": "The specified profile could not be found",
+      "m_code": 404
+    },
+    {
+      "name": "Wikipedia",
+      "category": "account",
+      "uri_check": "https://en.wikipedia.org/wiki/User:{account}",
+      "uri_pretty": "https://en.wikipedia.org/wiki/User:{account}",
+      "e_code": 200,
+      "e_string": "Wikipedia",
+      "m_string": "Wikipedia does not have a user page with this exact name",
+      "m_code": 404
+    },
+    {
+      "name": "Gist",
+      "category": "code",
+      "uri_check": "https://gist.github.com/{account}",
+      "uri_pretty": "https://gist.github.com/{account}",
+      "e_code": 200,
+      "e_string": "gist.github.com",
+      "m_string": "Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Sessionize",
+      "category": "corporate",
+      "uri_check": "https://sessionize.com/{account}/",
+      "uri_pretty": "https://sessionize.com/{account}/",
+      "e_code": 200,
+      "e_string": "Sessionize",
+      "m_string": "Speaker not found",
+      "m_code": 404
+    },
+    {
+      "name": "Gravatar",
+      "category": "account",
+      "uri_check": "https://gravatar.com/{account}",
+      "uri_pretty": "https://gravatar.com/{account}",
+      "e_code": 200,
+      "e_string": "gravatar.com",
+      "m_string": "Profile not found",
+      "m_code": 404
+    },
+    {
+      "name": "Hashnode",
+      "category": "code",
+      "uri_check": "https://hashnode.com/@{account}",
+      "uri_pretty": "https://hashnode.com/@{account}",
+      "e_code": 200,
+      "e_string": "Hashnode",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "Hackaday.io",
+      "category": "code",
+      "uri_check": "https://hackaday.io/{account}",
+      "uri_pretty": "https://hackaday.io/{account}",
+      "e_code": 200,
+      "e_string": "hackaday.io",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Exercism",
+      "category": "code",
+      "uri_check": "https://exercism.org/profiles/{account}",
+      "uri_pretty": "https://exercism.org/profiles/{account}",
+      "e_code": 200,
+      "e_string": "Exercism",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "Observable",
+      "category": "code",
+      "uri_check": "https://observablehq.com/@{account}",
+      "uri_pretty": "https://observablehq.com/@{account}",
+      "e_code": 200,
+      "e_string": "Observable",
+      "m_string": "Oops! We couldn't find that page",
+      "m_code": 404
+    },
+    {
+      "name": "Lobsters",
+      "category": "code",
+      "uri_check": "https://lobste.rs/~{account}",
+      "uri_pretty": "https://lobste.rs/~{account}",
+      "e_code": 200,
+      "e_string": "lobste.rs",
+      "m_string": "User not found",
+      "m_code": 404
+    },
+    {
+      "name": "Blogger",
+      "category": "account",
+      "uri_check": "https://{account}.blogspot.com/",
+      "uri_pretty": "https://{account}.blogspot.com/",
+      "e_code": 200,
+      "e_string": "blogger.com",
+      "m_string": "Blog not found",
+      "m_code": 404
+    },
+    {
+      "name": "Gumroad",
+      "category": "corporate",
+      "uri_check": "https://{account}.gumroad.com/",
+      "uri_pretty": "https://{account}.gumroad.com/",
+      "e_code": 200,
+      "e_string": "gumroad.com",
+      "m_string": "The page you are looking for doesn't exist",
+      "m_code": 404
+    },
+    {
+      "name": "BuyMeACoffee",
+      "category": "account",
+      "uri_check": "https://buymeacoffee.com/{account}",
+      "uri_pretty": "https://buymeacoffee.com/{account}",
+      "e_code": 200,
+      "e_string": "buymeacoffee.com",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Ko-fi",
+      "category": "account",
+      "uri_check": "https://ko-fi.com/{account}",
+      "uri_pretty": "https://ko-fi.com/{account}",
+      "e_code": 200,
+      "e_string": "ko-fi.com",
+      "m_string": "Sorry, we couldn't find that page",
+      "m_code": 404
+    },
+    {
+      "name": "Instructables",
+      "category": "account",
+      "uri_check": "https://www.instructables.com/member/{account}/",
+      "uri_pretty": "https://www.instructables.com/member/{account}/",
+      "e_code": 200,
+      "e_string": "instructables.com",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Unsplash",
+      "category": "account",
+      "uri_check": "https://unsplash.com/@{account}",
+      "uri_pretty": "https://unsplash.com/@{account}",
+      "e_code": 200,
+      "e_string": "unsplash.com",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "DeviantArt",
+      "category": "account",
+      "uri_check": "https://www.deviantart.com/{account}",
+      "uri_pretty": "https://www.deviantart.com/{account}",
+      "e_code": 200,
+      "e_string": "DeviantArt",
+      "m_string": "404 Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "SoundCloud",
+      "category": "account",
+      "uri_check": "https://soundcloud.com/{account}",
+      "uri_pretty": "https://soundcloud.com/{account}",
+      "e_code": 200,
+      "e_string": "SoundCloud",
+      "m_string": "We can't find that user",
+      "m_code": 404
+    },
+    {
+      "name": "Mixcloud",
+      "category": "account",
+      "uri_check": "https://www.mixcloud.com/{account}/",
+      "uri_pretty": "https://www.mixcloud.com/{account}/",
+      "e_code": 200,
+      "e_string": "Mixcloud",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Bandcamp",
+      "category": "account",
+      "uri_check": "https://bandcamp.com/{account}",
+      "uri_pretty": "https://bandcamp.com/{account}",
+      "e_code": 200,
+      "e_string": "bandcamp.com",
+      "m_string": "Sorry, that something isn't here",
+      "m_code": 404
+    },
+    {
+      "name": "Last.fm",
+      "category": "account",
+      "uri_check": "https://www.last.fm/user/{account}",
+      "uri_pretty": "https://www.last.fm/user/{account}",
+      "e_code": 200,
+      "e_string": "last.fm",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "MyAnimeList",
+      "category": "account",
+      "uri_check": "https://myanimelist.net/profile/{account}",
+      "uri_pretty": "https://myanimelist.net/profile/{account}",
+      "e_code": 200,
+      "e_string": "MyAnimeList",
+      "m_string": "404 Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "itch.io",
+      "category": "code",
+      "uri_check": "https://{account}.itch.io/",
+      "uri_pretty": "https://{account}.itch.io/",
+      "e_code": 200,
+      "e_string": "itch.io",
+      "m_string": "There is no page",
+      "m_code": 404
+    },
+    {
+      "name": "NameMC",
+      "category": "account",
+      "uri_check": "https://namemc.com/profile/{account}",
+      "uri_pretty": "https://namemc.com/profile/{account}",
+      "e_code": 200,
+      "e_string": "NameMC",
+      "m_string": "Profile not found",
+      "m_code": 404
+    },
+    {
+      "name": "LeetCode",
+      "category": "code",
+      "uri_check": "https://leetcode.com/u/{account}/",
+      "uri_pretty": "https://leetcode.com/u/{account}/",
+      "e_code": 200,
+      "e_string": "LeetCode",
+      "m_string": "Page Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "Codeforces",
+      "category": "code",
+      "uri_check": "https://codeforces.com/profile/{account}",
+      "uri_pretty": "https://codeforces.com/profile/{account}",
+      "e_code": 200,
+      "e_string": "Codeforces",
+      "m_string": "User not found",
+      "m_code": 404
+    },
+    {
+      "name": "AtCoder",
+      "category": "code",
+      "uri_check": "https://atcoder.jp/users/{account}",
+      "uri_pretty": "https://atcoder.jp/users/{account}",
+      "e_code": 200,
+      "e_string": "AtCoder",
+      "m_string": "404 Not Found",
+      "m_code": 404
+    },
+    {
+      "name": "MetaCPAN",
+      "category": "code",
+      "uri_check": "https://metacpan.org/author/{account}",
+      "uri_pretty": "https://metacpan.org/author/{account}",
+      "e_code": 200,
+      "e_string": "metacpan",
+      "m_string": "Author not found",
+      "m_code": 404
+    },
+    {
+      "name": "Packagist",
+      "category": "code",
+      "uri_check": "https://packagist.org/users/{account}/",
+      "uri_pretty": "https://packagist.org/users/{account}/",
+      "e_code": 200,
+      "e_string": "Packagist",
+      "m_string": "User not found",
+      "m_code": 404
+    },
+    {
+      "name": "Hex.pm",
+      "category": "code",
+      "uri_check": "https://hex.pm/users/{account}",
+      "uri_pretty": "https://hex.pm/users/{account}",
+      "e_code": 200,
+      "e_string": "hex.pm",
+      "m_string": "Page not found",
+      "m_code": 404
+    },
+    {
+      "name": "Gitee",
+      "category": "code",
+      "uri_check": "https://gitee.com/{account}",
+      "uri_pretty": "https://gitee.com/{account}",
+      "e_code": 200,
+      "e_string": "gitee.com",
+      "m_string": "404",
+      "m_code": 404
+    }
+  ]
+}

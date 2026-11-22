@@ -1,0 +1,52 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- Deep Obsidian Canvas -->
+    <linearGradient id="taufBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#141720" />
+      <stop offset="50%" stop-color="#0A0C10" />
+      <stop offset="100%" stop-color="#050608" />
+    </linearGradient>
+
+    <!-- Subtle Obsidian Core Ambient Depth -->
+    <radialGradient id="taufAmbientGrad" cx="50%" cy="42%" r="54%">
+      <stop offset="0%" stop-color="#14E0A8" stop-opacity="0.10" />
+      <stop offset="65%" stop-color="#059669" stop-opacity="0.025" />
+      <stop offset="100%" stop-color="#050608" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Continuous Luminous Aqua-Green Monogram Gradient -->
+    <linearGradient id="taufAquaGrad" gradientUnits="userSpaceOnUse" x1="120" y1="100" x2="360" y2="416">
+      <stop offset="0%" stop-color="#4DFFCE" />
+      <stop offset="38%" stop-color="#14E0A8" />
+      <stop offset="76%" stop-color="#0AB885" />
+      <stop offset="100%" stop-color="#059669" />
+    </linearGradient>
+
+    <!-- Clip Path keeping outer rim & specular bevel flush inside squircle boundary -->
+    <clipPath id="taufSquircleClip">
+      <rect x="28" y="28" width="456" height="456" rx="96" />
+    </clipPath>
+
+    <!-- Subtle Controlled Optical Bloom -->
+    <filter id="taufOpticalBloom" x="-22%" y="-22%" width="144%" height="144%">
+      <feGaussianBlur stdDeviation="6.5" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- 100% Symmetrical Obsidian Beveled Squircle -->
+  <rect x="28" y="28" width="456" height="456" rx="96" fill="url(#taufBgGrad)" />
+  <g clip-path="url(#taufSquircleClip)">
+    <rect x="28" y="28" width="456" height="456" fill="url(#taufAmbientGrad)" />
+    <rect x="29" y="29" width="454" height="454" rx="95" fill="none" stroke="rgba(20, 224, 168, 0.28)" stroke-width="2" />
+    <rect x="31" y="31" width="450" height="450" rx="93" fill="none" stroke="rgba(255, 255, 255, 0.06)" stroke-width="1.25" />
+  </g>
+
+  <!-- Central Sculpted T Monogram with 45-deg Geometric Signal-Notch Channel -->
+  <g filter="url(#taufOpticalBloom)">
+    <path d="M 102 98 H 374 L 304 168 C 296 170, 292 184, 292 212 V 392 L 268 416 H 220 V 212 C 220 184, 212 168, 180 168 H 116 L 88 140 V 112 Z"
+          fill="url(#taufAquaGrad)" />
+    <path d="M 400 98 H 410 L 424 112 V 140 L 396 168 H 330 Z"
+          fill="url(#taufAquaGrad)" />
+  </g>
+</svg>

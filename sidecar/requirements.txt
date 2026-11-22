@@ -1,0 +1,21 @@
+# TAUF V5 Local Sovereign Open-Source Sidecar Dependencies
+# Zero external OSINT SaaS APIs; all tools execute locally inside sidecar/.venv.
+
+# Passive username / profile discovery & structured metadata extraction
+maigret
+sherlock-project
+socid-extractor
+
+# Active-adjacent registration checks (skipped when passive_only is enabled)
+holehe
+ignorant
+
+# Local offline corpus & Tor .onion search
+h8mail
+onionsearch
+
+# HTTP & SOCKS5h proxy transport
+socksio
+requests
+httpx
+PySocks
