@@ -47,6 +47,16 @@ function decodeHtmlEntitiesOnce(text: string): string {
   );
 }
 
+const ASSET_CDN_URL_RE =
+  /https?:\/\/[^\s,;|"'<>]*(?:githubassets\.com|githubusercontent\.com|fonts\.googleapis\.com|fonts\.gstatic\.com|cdn\.jsdelivr\.net|unpkg\.com)[^\s,;|"'<>]*/gi;
+
+export function isAssetCdnUrl(url: string | null | undefined): boolean {
+  if (!url) return false;
+  return /(?:githubassets\.com|githubusercontent\.com|fonts\.googleapis\.com|fonts\.gstatic\.com|cdn\.jsdelivr\.net|unpkg\.com)/i.test(
+    url
+  );
+}
+
 export function sanitizeDisplayText(
   raw: string | null | undefined
 ): string | null {
@@ -61,6 +71,12 @@ export function sanitizeDisplayText(
   out = out.replace(/<[^>]+>/g, " ");
   // Decode HTML entities (2 passes handles double-encoded &amp;#39; / &amp;middot;)
   out = decodeHtmlEntitiesOnce(decodeHtmlEntitiesOnce(out));
+  // Strip leaked asset-CDN URLs (e.g. github.githubassets.com, avatars.githubusercontent.com)
+  out = out.replace(ASSET_CDN_URL_RE, "");
+  out = out.replace(/\bLinks:\s*(?:[,;|·•]\s*)*(?=$|[·|;])/gi, "");
+  out = out.replace(/,\s*(?:,\s*)+/g, ", ");
+  out = out.replace(/\bLinks:\s*,\s*/gi, "Links: ");
+  out = out.replace(/(?:^|\s)[,;|·•]\s*$/g, "");
   out = out.replace(/\s+/g, " ").trim();
   return out.length > 0 ? out : null;
 }
@@ -318,16 +334,25 @@ function isDocumentNode(node: GraphNode): boolean {
   return kind === "document" || kind === "pdf" || kind === "doc";
 }
 
+const GIST_ID_PATH_RE =
+  /gist\.github\.com\/[^/?#]+\/[0-9a-f]{12,40}(?:[/?#]|$)/i;
+
 function isPasteNode(node: GraphNode): boolean {
   const kind = node.kind.toLowerCase();
   if (kind === "paste" || kind === "paste_mention") return true;
+  if (kind === "account") return false;
   const u = (node.url || "").toLowerCase();
+  if (u.includes("gist.github.com")) {
+    return GIST_ID_PATH_RE.test(u);
+  }
   return (
     u.includes("pastebin.com") ||
     u.includes("rentry.co") ||
     u.includes("paste.ee") ||
     u.includes("dpaste") ||
-    u.includes("gist.github.com")
+    u.includes("justpaste.it") ||
+    u.includes("ghostbin.me") ||
+    u.includes("controlc.com")
   );
 }
 
@@ -1012,7 +1037,10 @@ export function classifyIntel(
       location: sanitizeDisplayText(node.metadata?.location),
       org: sanitizeDisplayText(node.metadata?.org || node.metadata?.company),
       timezone: node.metadata?.timezone || null,
-      website: node.metadata?.website || node.metadata?.blog || null,
+      website: (() => {
+        const rawSite = node.metadata?.website || node.metadata?.blog || null;
+        return rawSite && !isAssetCdnUrl(rawSite) ? rawSite : null;
+      })(),
       skills: sanitizeDisplayText(
         node.metadata?.skills || node.metadata?.languages
       ),

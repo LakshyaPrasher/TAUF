@@ -1011,7 +1011,24 @@ export function FindingsStream({
               const torRun = toolRuns.find(
                 (t) => t.tool === "tor-socks5h" || t.tool === "local_tor_socks5"
               );
+              const onionSearchRun = toolRuns.find(
+                (t) => t.tool === "onionsearch"
+              );
               const torDetail = torRun?.detail?.trim() || null;
+              const onionSearchDetail = onionSearchRun?.detail?.trim() || null;
+              const isTorScanning =
+                torRun?.state === "running" ||
+                onionSearchRun?.state === "running";
+              const isTorOfflineSkip =
+                !envStatus?.tor_socks_available && torRun?.state === "skipped";
+              const coverageVerdict = isTorScanning
+                ? "Scanning live .onion search indexes over Tor SOCKS5h..."
+                : isTorOfflineSkip
+                ? "Tor daemon was offline during this pass — start Tor to query .onion indexes."
+                : intel.broadOnionHits.length > 0
+                ? "0 genuine matches found — all raw/sponsored noise filtered. Inspect possible broad mentions below."
+                : "0 genuine matches found — all raw/sponsored noise filtered.";
+
               return (
                 <div className="intel-block">
                   <div className="block-head">
@@ -1048,14 +1065,49 @@ export function FindingsStream({
                       </div>
                     </>
                   ) : (
-                    <p className="block-empty">
-                      {intel.broadOnionHits.length > 0
-                        ? torDetail
-                          ? `${torDetail} — inspect possible broad mentions below.`
-                          : "0 exact or handle-matched .onion hits — inspect possible broad mentions below."
-                        : torDetail ||
-                          "0 .onion mentions across configured Tor search engines."}
-                    </p>
+                    <div className="darkweb-coverage-box" role="status">
+                      <div className="coverage-head">
+                        <span className="coverage-title">
+                          Tor Dark Web Coverage
+                        </span>
+                        <span
+                          className={`coverage-status mono ${
+                            envStatus?.tor_socks_available
+                              ? "is-live"
+                              : "is-offline"
+                          }`}
+                        >
+                          {envStatus?.tor_socks_available
+                            ? envStatus.tor_exit_ip
+                              ? `Live via Tor · exit ${envStatus.tor_exit_ip}`
+                              : "Live via Tor"
+                            : "Tor offline"}
+                        </span>
+                      </div>
+                      {(torDetail || onionSearchDetail) && (
+                        <div className="coverage-lines">
+                          {torDetail && (
+                            <div className="coverage-line">
+                              <span className="coverage-k mono">
+                                tor-socks5h
+                              </span>
+                              <span className="coverage-v">{torDetail}</span>
+                            </div>
+                          )}
+                          {onionSearchDetail && (
+                            <div className="coverage-line">
+                              <span className="coverage-k mono">
+                                onionsearch
+                              </span>
+                              <span className="coverage-v">
+                                {onionSearchDetail}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <p className="coverage-verdict">{coverageVerdict}</p>
+                    </div>
                   )}
 
                   {intel.broadOnionHits.length > 0 && (

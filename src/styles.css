@@ -2671,6 +2671,87 @@ details[open] > summary .disclosure-chevron {
   word-break: break-word;
 }
 
+.darkweb-coverage-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background-color: var(--bg-surface);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+}
+
+.coverage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.coverage-title {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.coverage-status {
+  font-size: 11px;
+  line-height: 15px;
+  padding: 1px 7px;
+  border-radius: 5px;
+  border: 1px solid var(--hairline);
+}
+
+.coverage-status.is-live {
+  color: var(--sage);
+  background-color: rgba(79, 180, 142, 0.08);
+  border-color: rgba(79, 180, 142, 0.3);
+}
+
+.coverage-status.is-offline {
+  color: var(--amber);
+  background-color: rgba(217, 155, 56, 0.08);
+  border-color: rgba(217, 155, 56, 0.3);
+}
+
+.coverage-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-top: 6px;
+  border-top: 1px solid var(--hairline);
+}
+
+.coverage-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 16px;
+  min-width: 0;
+}
+
+.coverage-k {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.coverage-v {
+  color: var(--text-secondary);
+  word-break: break-word;
+  min-width: 0;
+}
+
+.coverage-verdict {
+  margin: 0;
+  padding-top: 6px;
+  border-top: 1px solid var(--hairline);
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--sage);
+}
+
 .onion-card {
   display: flex;
   flex-direction: column;

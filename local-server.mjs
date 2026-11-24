@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SERVER_BUILD_ID = "v5.2-universal-osint";
+const SERVER_BUILD_ID = "v5.3-darkweb-clarity";
 
 const DIST_DIR = path.join(__dirname, "dist");
 const WMN_PATH = path.join(__dirname, "src-tauri", "resources", "wmn_curated.json");
@@ -131,6 +131,14 @@ const PLATFORM_NOISE_DOMAINS = [
   "domain.com",
   "yourdomain.com",
   "test.com",
+  "github.githubassets.com",
+  "githubassets.com",
+  "githubusercontent.com",
+  "avatars.githubusercontent.com",
+  "cdn.jsdelivr.net",
+  "unpkg.com",
+  "fonts.googleapis.com",
+  "fonts.gstatic.com",
   "users.noreply.github.com",
   "sentry.io",
   "w3.org",
@@ -2139,7 +2147,7 @@ function extractPageSignals(html, pageUrl) {
   const cleanedHtml = stripBoilerplateHtml(html);
 
   const outboundUrls = new Set();
-  for (const m of cleanedHtml.matchAll(/href=["'](https?:\/\/[^"'\s<>]+)["']/gi)) {
+  for (const m of cleanedHtml.matchAll(/<a\b[^>]*href=["'](https?:\/\/[^"'\s<>]+)["']/gi)) {
     const u = m[1];
     try {
       const host = new URL(u).hostname.toLowerCase();
@@ -2165,7 +2173,14 @@ function stripBoilerplateHtml(html) {
 }
 
 function scoreProfileMatch(signals, fullName, knownOrgs, knownDomains, knownEmails, isSeedHandle) {
-  const combinedText = `${signals.title} ${signals.description}`.toLowerCase();
+  const rawTitle = String(signals.title || "");
+  const rawDesc = String(signals.description || "");
+  const isGistBoilerplate = /(?:['’`]|&#39;|&rsquo;|&apos;)s\s+gists\b/i.test(rawTitle) || /github gist:\s*star and fork/i.test(rawDesc);
+  const cleanTitle = isGistBoilerplate ? rawTitle.replace(/^.+?(?:['’`]|&#39;|&rsquo;|&apos;)s\s+gists\b.*$/i, "") : rawTitle;
+  const cleanDesc = isGistBoilerplate
+    ? rawDesc.replace(/github gist:\s*star and fork[\s\S]*?(?:on\s+github\.?|$)/gi, "")
+    : rawDesc;
+  const combinedText = `${cleanTitle} ${cleanDesc}`.toLowerCase();
   const fullMatch = hasFullNameMatch(combinedText, fullName);
   const sharedOrg = knownOrgs.some((o) => o.length >= 3 && combinedText.includes(o.toLowerCase()));
   const sharedDom = knownDomains.some(
@@ -3909,7 +3924,88 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
 }
 
 /**
- * Real Ahmia v3 .onion parser over Tor SOCKS5h:
+ * Public Paste & Leak Mention Discovery over Tor (Startpage with IsolateSOCKSAuth 3-circuit retry):
+ * Searches Pastebin, Rentry, Dpaste, JustPaste.it, Ghostbin, ControlC, Paste.ee, and leak/breach
+ * references for exact full-name or exact email matches (zero false positives).
+ */
+async function discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles, netCtx, depthLevel = 2) {
+  const hits = [];
+  const seenUrls = new Set();
+  const nonce = `pl-${Math.floor(Date.now() / 1000).toString(36)}`;
+  let seq = 0;
+  const nextSocksUser = () => `${nonce}-${++seq}`;
+
+  const queries = [
+    {
+      q: `"${fullName}" (site:pastebin.com OR site:rentry.co OR site:dpaste.org OR site:justpaste.it OR site:ghostbin.me OR site:controlc.com OR site:paste.ee)`,
+      queryType: "full_name",
+      parentEmail: null,
+      requireLeakKeyword: false,
+    },
+  ];
+  if (knownEmails.length > 0) {
+    queries.push({
+      q: `"${knownEmails[0]}" (site:pastebin.com OR site:rentry.co OR site:justpaste.it OR "leak" OR "breach" OR "combolist" OR "paste")`,
+      queryType: "email",
+      parentEmail: knownEmails[0],
+      requireLeakKeyword: false,
+    });
+  }
+  if (depthLevel >= 3) {
+    queries.push({
+      q: `"${fullName}" ("doxbin" OR "breach" OR "combolist" OR "leaked database" OR ".onion")`,
+      queryType: "full_name",
+      parentEmail: null,
+      requireLeakKeyword: true,
+    });
+  }
+
+  const pasteOrLeakRe = /\b(doxbin|breach|combolist|leaked|leak|paste|pastebin|rentry|dpaste|justpaste|ghostbin|controlc|paste\.ee|\.onion)\b/i;
+
+  for (const spec of queries) {
+    const spRes = await queryStartpageWithRetry(spec.q, netCtx, nextSocksUser, 15000);
+    if (spRes.strictBlocked) break;
+    if (!spRes.ok) continue;
+    for (const item of spRes.items.slice(0, 8)) {
+      if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
+      if (seenUrls.has(item.url)) continue;
+      const textCombined = `${item.title || ""} ${item.snippet || ""}`;
+      const matched =
+        spec.queryType === "email" && spec.parentEmail
+          ? textCombined.toLowerCase().includes(spec.parentEmail.toLowerCase())
+          : hasFullNameMatch(textCombined, fullName);
+      if (!matched) continue;
+      if (spec.requireLeakKeyword && !pasteOrLeakRe.test(`${item.url} ${textCombined}`)) continue;
+
+      let host = "";
+      try {
+        host = new URL(item.url).hostname.replace(/^www\./, "").toLowerCase();
+      } catch {
+        host = "paste";
+      }
+      // Never misclassify regular GitHub Gist user profiles as paste leaks
+      if (host === "gist.github.com" && !/\/[a-f0-9]{16,}/i.test(item.url)) continue;
+
+      seenUrls.add(item.url);
+      hits.push({
+        title: (item.title || host).slice(0, 110),
+        url: item.url,
+        snippet: (item.snippet || "").slice(0, 240),
+        host,
+        matchedTerm: spec.parentEmail || fullName,
+        queryType: spec.queryType,
+        parentEmail: spec.parentEmail,
+      });
+      if (hits.length >= 8) break;
+    }
+    if (hits.length >= 8) break;
+  }
+
+  return hits;
+}
+
+/**
+ * Real Ahmia v3 .onion parser over Tor SOCKS5h (with clean https://ahmia.fi over-Tor fallback):
  * Quotes multi-word names accurately, grabs rotating hidden form token + cookie,
  * and parses `<li class="result">` items cleanly.
  */
@@ -3918,60 +4014,68 @@ async function queryAhmiaOnion(torHost, torPort, rawQuery) {
   const cleanQuery = String(rawQuery || "").replace(/^["']+|["']+$/g, "").trim();
   if (!cleanQuery) return hits;
   const formattedQuery = /\s/.test(cleanQuery) ? `"${cleanQuery}"` : cleanQuery;
-  try {
-    const home = await socks5hRequest(torHost, torPort, `${AHMIA_V3_BASE}/`, {
-      timeoutMs: 14000,
-      maxBytes: 90_000,
-      jitter: false,
-    });
-    if (!home.ok) return hits;
-    const homeHtml = await home.text();
-    const hm = homeHtml.match(/<input[^>]+type=["']hidden["'][^>]+name=["']([^"']+)["'][^>]+value=["']([^"']+)["']/i);
-    const cookie = home.headers.get("set-cookie")?.split(";")[0] || null;
-    const searchUrl = hm
-      ? `${AHMIA_V3_BASE}/search/?q=${encodeURIComponent(formattedQuery)}&${encodeURIComponent(hm[1])}=${encodeURIComponent(hm[2])}`
-      : `${AHMIA_V3_BASE}/search/?q=${encodeURIComponent(formattedQuery)}`;
 
-    const res = await socks5hRequest(torHost, torPort, searchUrl, {
-      timeoutMs: 16000,
-      maxBytes: 750_000,
-      jitter: false,
-      headers: cookie ? { Cookie: cookie } : {},
-    });
-    if (!res.ok) return hits;
-    const html = await res.text();
-    const lis = html.match(/<li class="result"[\s\S]*?<\/li>/gi) || [];
-    for (const li of lis.slice(0, 15)) {
-      const h4 = li.match(/<h4[^>]*>([\s\S]*?)<\/h4>/i);
-      const cite = li.match(/<cite[^>]*>([\s\S]*?)<\/cite>/i);
-      const p = li.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
-      const aHref = li.match(/href="([^"]+)"/i);
-      let onionUrl = cite ? decodeHtmlEntities(cite[1].replace(/<[^>]+>/g, "")) : "";
-      if (aHref) {
-        const redir = aHref[1].match(/redirect_url=(https?[^&"']+)/i);
-        if (redir) {
-          try {
-            onionUrl = decodeURIComponent(redir[1]);
-          } catch {
-            // keep cite
+  const queryBase = async (baseUrl, engineLabel) => {
+    try {
+      const home = await socks5hRequest(torHost, torPort, `${baseUrl}/`, {
+        timeoutMs: 14000,
+        maxBytes: 90_000,
+        jitter: false,
+      });
+      if (!home.ok) return;
+      const homeHtml = await home.text();
+      const hm = homeHtml.match(/<input[^>]+type=["']hidden["'][^>]+name=["']([^"']+)["'][^>]+value=["']([^"']+)["']/i);
+      const cookie = home.headers.get("set-cookie")?.split(";")[0] || null;
+      const searchUrl = hm
+        ? `${baseUrl}/search/?q=${encodeURIComponent(formattedQuery)}&${encodeURIComponent(hm[1])}=${encodeURIComponent(hm[2])}`
+        : `${baseUrl}/search/?q=${encodeURIComponent(formattedQuery)}`;
+
+      const res = await socks5hRequest(torHost, torPort, searchUrl, {
+        timeoutMs: 16000,
+        maxBytes: 750_000,
+        jitter: false,
+        headers: cookie ? { Cookie: cookie } : {},
+      });
+      if (!res.ok) return;
+      const html = await res.text();
+      const lis = html.match(/<li class="result"[\s\S]*?<\/li>/gi) || [];
+      for (const li of lis.slice(0, 15)) {
+        const h4 = li.match(/<h4[^>]*>([\s\S]*?)<\/h4>/i);
+        const cite = li.match(/<cite[^>]*>([\s\S]*?)<\/cite>/i);
+        const p = li.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+        const aHref = li.match(/href="([^"]+)"/i);
+        let onionUrl = cite ? decodeHtmlEntities(cite[1].replace(/<[^>]+>/g, "")) : "";
+        if (aHref) {
+          const redir = aHref[1].match(/redirect_url=(https?[^&"']+)/i);
+          if (redir) {
+            try {
+              onionUrl = decodeURIComponent(redir[1]);
+            } catch {
+              // keep cite
+            }
           }
         }
+        if (!onionUrl || !onionUrl.includes(".onion")) continue;
+        if (!onionUrl.startsWith("http")) onionUrl = `http://${onionUrl}`;
+        if (onionUrl.includes("juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd")) continue;
+        const title = h4 ? decodeHtmlEntities(h4[1].replace(/<[^>]+>/g, " ")) : onionUrl;
+        const snippet = p ? decodeHtmlEntities(p[1].replace(/<[^>]+>/g, " ")) : "";
+        hits.push({
+          engine: engineLabel,
+          query: cleanQuery,
+          title: title.slice(0, 120),
+          url: onionUrl,
+          snippet: snippet.slice(0, 260),
+        });
       }
-      if (!onionUrl || !onionUrl.includes(".onion")) continue;
-      if (!onionUrl.startsWith("http")) onionUrl = `http://${onionUrl}`;
-      if (onionUrl.includes("juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd")) continue;
-      const title = h4 ? decodeHtmlEntities(h4[1].replace(/<[^>]+>/g, " ")) : onionUrl;
-      const snippet = p ? decodeHtmlEntities(p[1].replace(/<[^>]+>/g, " ")) : "";
-      hits.push({
-        engine: "Ahmia v3",
-        query: cleanQuery,
-        title: title.slice(0, 120),
-        url: onionUrl,
-        snippet: snippet.slice(0, 260),
-      });
+    } catch {
+      // ignore Tor circuit timeout
     }
-  } catch {
-    // ignore Tor circuit timeout
+  };
+
+  await queryBase(AHMIA_V3_BASE, "Ahmia v3");
+  if (hits.length === 0) {
+    await queryBase("https://ahmia.fi", "Ahmia Mirror (Tor)");
   }
   return hits;
 }
@@ -6525,8 +6629,8 @@ async function runInvestigation(caseId, input, auth) {
   };
 
   if (input.enable_tor) {
-    emitStage("tor_darkweb", "Searching live Tor .onion indexes (Ahmia v3 + OnionLand v3)", 82);
-    emitTool("tor-socks5h", "running", 0, "Querying Ahmia v3 & OnionLand v3 over socks5h://");
+    emitStage("tor_darkweb", "Searching live Tor .onion indexes (Ahmia v3 + OnionLand v3) & paste/leak indexes", 82);
+    emitTool("tor-socks5h", "running", 0, "Querying Ahmia v3, OnionLand v3 & paste/leak indexes over socks5h://");
     if (!tor.available) {
       emitTool("tor-socks5h", "skipped", 0, "Tor offline (127.0.0.1:9050)");
     } else {
@@ -6552,6 +6656,13 @@ async function runInvestigation(caseId, input, auth) {
       const queriesToRun = structuredQueries.slice(0, termLimit);
       const rawCandidates = []; // [{ hit, queryObj }]
       const darkStats = { adsFiltered: 0 };
+
+      // Run public paste/leak index search over Tor in parallel with live .onion index queries
+      const pastePromise =
+        depthLevel >= 2
+          ? discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles, netCtx, depthLevel).catch(() => [])
+          : Promise.resolve([]);
+
       for (const qObj of queriesToRun) {
         const [ahmiaHits, olHits] = await Promise.all([
           queryAhmiaOnion(tor.host, tor.port, qObj.query),
@@ -6596,13 +6707,63 @@ async function runInvestigation(caseId, input, auth) {
         }
       }
 
+      const pasteMentions = await pastePromise;
+      let pasteHits = 0;
+      for (const p of pasteMentions) {
+        const pasteId = normalizeNodeId("paste", p.url);
+        const emParentId = p.parentEmail ? normalizeNodeId("email", p.parentEmail) : null;
+        const parentId =
+          emParentId && snap.nodes.some((n) => n.id === emParentId) ? emParentId : seedId;
+        const pDepth = findNodeDepth(parentId) + 1;
+        const conf = p.queryType === "email" ? 0.88 : 0.8;
+        addNode({
+          id: pasteId,
+          kind: "paste",
+          label: p.title.slice(0, 64),
+          sublabel: `${p.host} · Paste / Leak Mention`,
+          layer: "darkweb",
+          confidence: conf,
+          status: "unverified",
+          sources: ["tor-socks5h"],
+          metadata: {
+            source: p.host,
+            matched_term: p.matchedTerm,
+            matched_identifier: p.queryType === "email" ? `Email: ${p.matchedTerm}` : `Full Name: ${p.matchedTerm}`,
+            bio: p.snippet,
+            match_tier: "verified",
+            match_reason: `Public paste/leak mention on ${p.host}`,
+          },
+          url: p.url,
+          depth: pDepth,
+        });
+        addEdge(parentId, pasteId, "paste_mention", conf, "tor-socks5h");
+        addFinding({
+          id: `finding:paste:${pasteId}`,
+          node_id: pasteId,
+          title: `Public Paste / Leak Mention: ${p.title}`,
+          category: "darkweb",
+          severity: p.queryType === "email" ? "high" : "medium",
+          confidence: conf,
+          consensus_count: 1,
+          sources: ["tor-socks5h"],
+          summary: `${p.host} matched ${p.matchedTerm}: ${p.snippet || p.title}`,
+          pivot_trail: [`Name: ${fullName}`, `Paste/Leak Index -> ${p.host}`, p.url],
+          url: p.url,
+          timestamp: now,
+          sensitive_fields: [p.matchedTerm],
+        });
+        pasteHits++;
+      }
+
       const filteredCount = darkStats.adsFiltered + spamRejected;
       const exitSuffix = state.torExitIp ? ` · exit ${state.torExitIp}` : "";
+      const pasteSuffix = depthLevel >= 2 ? ` + ${pasteHits} paste/leak hit(s)` : "";
+      const enginesLabel = depthLevel >= 2 ? "Ahmia v3, OnionLand v3 & Paste/Leak indexes" : "Ahmia v3 & OnionLand v3";
       emitTool(
         "tor-socks5h",
         "done",
-        torHits,
-        `Searched Ahmia v3 & OnionLand v3 across ${queriesToRun.length} term(s) — ${torHits} relevant .onion hit(s) (${filteredCount} spam/ads filtered)${exitSuffix}`
+        torHits + pasteHits,
+        `Searched ${enginesLabel} across ${queriesToRun.length} term(s) — ${torHits} relevant .onion hit(s)${pasteSuffix} (${filteredCount} spam/ads filtered)${exitSuffix}`
       );
     }
   } else {
