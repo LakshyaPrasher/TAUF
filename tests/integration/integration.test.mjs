@@ -560,7 +560,7 @@ if (shouldRun("A5")) {
     "quarantined",
     "redactProxyUrl",
     "isUnsafeCorpusRoot",
-    "getConfiguredOnionBase",
+    "getConfiguredOnionBases",
     "scanLocalCorpus",
     "createReadStream",
     "readline",

@@ -828,10 +828,103 @@ function decodeChunkedBody(buf) {
   return { buf: Buffer.concat(parts), truncated };
 }
 
-async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectDepth = 0) {
-  if (redirectDepth > 5) {
-    throw new Error("Too many redirects over SOCKS5h");
+/**
+ * NET-7: parse an HTTP/1.x response head (status line + header lines) without
+ * collapsing repeated Set-Cookie headers into one value.
+ *
+ * Header names are lowercased and duplicates are last-wins, except
+ * `set-cookie`, whose values are collected in order into `setCookies`. The
+ * `headers` map also exposes the joined `set-cookie` value so callers that only
+ * understand `get()` still see every cookie.
+ *
+ * @param {string} headStr raw head text, without the terminating CRLFCRLF
+ * @returns {{ status: number, headers: Map<string, string>, setCookies: string[] }}
+ */
+function parseHttpHead(headStr) {
+  const lines = String(headStr).split(/\r?\n/);
+  const statusMatch = (lines[0] || "").match(/^HTTP\/\d\.\d\s+(\d{3})/);
+  const status = statusMatch ? Number(statusMatch[1]) : 0;
+  const headers = new Map();
+  const setCookies = [];
+  for (const ln of lines.slice(1)) {
+    if (!ln) continue;
+    const colon = ln.indexOf(":");
+    if (colon === -1) continue;
+    const name = ln.slice(0, colon).trim().toLowerCase();
+    const value = ln.slice(colon + 1).trim();
+    if (!name) continue;
+    if (name === "set-cookie") {
+      setCookies.push(value);
+      headers.set(name, setCookies.join(", "));
+      continue;
+    }
+    headers.set(name, value);
   }
+  return { status, headers, setCookies };
+}
+
+/**
+ * NET-6: derive the options for the next hop of a redirect.
+ *
+ * - Cross-host redirects drop Cookie/Authorization (any capitalization) so
+ *   credentials never leak to a third party; other headers are preserved.
+ * - 303 always becomes a bodyless GET; 301/302 do so unless the method was
+ *   already GET/HEAD; 307/308 preserve method and body.
+ *
+ * The returned object is new: the caller's `opts` (and its `headers`) are never
+ * mutated.
+ *
+ * @param {object} opts current request options
+ * @param {number} status redirect status code
+ * @param {string} fromHost lowercase hostname of the current hop (no port)
+ * @param {string} toHost lowercase hostname of the next hop (no port)
+ * @returns {object} options for the recursive request
+ */
+function buildRedirectOptions(opts, status, fromHost, toHost) {
+  const next = { ...(opts || {}) };
+  const crossHost = String(fromHost || "").toLowerCase() !== String(toHost || "").toLowerCase();
+
+  if (opts && opts.headers) {
+    const headers = {};
+    for (const [key, value] of Object.entries(opts.headers)) {
+      const lower = key.toLowerCase();
+      if (crossHost && (lower === "cookie" || lower === "authorization")) continue;
+      headers[key] = value;
+    }
+    next.headers = headers;
+  }
+
+  const method = String((opts && opts.method) || "GET").toUpperCase();
+  const toGet = status === 303 || ((status === 301 || status === 302) && method !== "GET" && method !== "HEAD");
+  if (toGet) {
+    next.method = "GET";
+    delete next.body;
+    delete next.bodyBytes;
+  }
+  return next;
+}
+
+// Bounded rolling sample of successful SOCKS5h round-trip times (ms).
+// The budget-driven ETA engine derives its rttFactor from the median so a slow
+// Tor circuit stretches only the *future* wave estimates, never the counts.
+const RTT_SAMPLE_LIMIT = 20;
+const rttSamples = [];
+
+function recordRttSample(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return;
+  rttSamples.push(n);
+  if (rttSamples.length > RTT_SAMPLE_LIMIT) {
+    rttSamples.splice(0, rttSamples.length - RTT_SAMPLE_LIMIT);
+  }
+}
+
+function getRttSamples() {
+  return rttSamples.slice();
+}
+
+async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectDepth = 0) {
+  const rttStartedMs = Date.now();
   const parsed = new URL(rawUrl);
   const isHttps = parsed.protocol === "https:";
   const targetHost = parsed.hostname;
@@ -934,20 +1027,16 @@ async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectD
   }
   const headStr = responseBuf.subarray(0, sepIdx).toString("latin1");
   let bodyBuf = responseBuf.subarray(sepIdx + 4);
-  const headLines = headStr.split("\r\n");
-  const statusMatch = headLines[0].match(/^HTTP\/\d\.\d\s+(\d{3})/);
-  const status = statusMatch ? Number(statusMatch[1]) : 0;
-  const headers = new Map();
-  for (const ln of headLines.slice(1)) {
-    const colon = ln.indexOf(":");
-    if (colon !== -1) {
-      headers.set(ln.slice(0, colon).trim().toLowerCase(), ln.slice(colon + 1).trim());
-    }
-  }
+  const { status, headers, setCookies } = parseHttpHead(headStr);
 
   if ([301, 302, 303, 307, 308].includes(status) && headers.get("location")) {
+    if (redirectDepth >= 5) {
+      throw new Error("Too many redirects over SOCKS5h");
+    }
     const nextUrl = new URL(headers.get("location"), rawUrl).toString();
-    return socks5hRequest(proxyHost, proxyPort, nextUrl, opts, redirectDepth + 1);
+    const nextHost = new URL(nextUrl).hostname.toLowerCase();
+    const nextOpts = buildRedirectOptions(opts, status, targetHost.toLowerCase(), nextHost);
+    return socks5hRequest(proxyHost, proxyPort, nextUrl, nextOpts, redirectDepth + 1);
   }
 
   let truncated = readCapped;
@@ -1008,12 +1097,19 @@ async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectD
     ? "[TAUF: compressed body could not be decompressed — raw bytes preserved in buffer()]"
     : null;
 
+  recordRttSample(Date.now() - rttStartedMs);
+
   return {
     ok: status >= 200 && status < 300,
     status,
     url: rawUrl,
     headers: {
-      get: (k) => headers.get(String(k).toLowerCase()) || null,
+      get: (k) => {
+        const key = String(k).toLowerCase();
+        if (key === "set-cookie") return setCookies.length ? setCookies.join(", ") : null;
+        return headers.get(key) || null;
+      },
+      getSetCookie: () => (setCookies.length ? setCookies.slice() : []),
     },
     // NET-4 / NET-5: body bytes are only exposed as text when they are really
     // decoded; otherwise a labelled fallback keeps a silent-garbage body legible.
@@ -2570,7 +2666,46 @@ async function probeGitlabRaw(handle, netCtx) {
 // Engine 5: Direct 80-Platform WhatsMyName Engine + Multi-Signal Verification
 // ---------------------------------------------------------------------------
 
-const WMN_SITES = loadJson(WMN_PATH, { sites: [] }).sites || [];
+/**
+ * OPT-05: WhatsMyName is an external data dependency. Validate the shape at load
+ * time instead of trusting it: a malformed `wmn_curated.json` used to throw at
+ * boot (`null.sites`) or crash site checks on missing templates. Invalid entries
+ * are dropped, and an unusable file degrades to an empty list (never overwritten).
+ */
+function loadWmnSites(filePath) {
+  let parsed;
+  try {
+    parsed = loadJson(filePath, { sites: [] });
+  } catch (err) {
+    logRuntime(`[WMN] Could not load ${path.basename(filePath)}: ${err && err.message ? err.message : String(err)}`);
+    return [];
+  }
+  const rawSites = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed.sites : null;
+  if (!Array.isArray(rawSites)) {
+    logRuntime("[WMN] wmn_curated.json has an invalid shape (expected { sites: [...] }); using an empty site list.");
+    return [];
+  }
+  const valid = rawSites.filter(
+    (s) =>
+      s &&
+      typeof s === "object" &&
+      !Array.isArray(s) &&
+      typeof s.uri_check === "string" &&
+      s.uri_check.trim().length > 0 &&
+      typeof s.uri_pretty === "string" &&
+      s.uri_pretty.trim().length > 0
+  );
+  const dropped = rawSites.length - valid.length;
+  if (dropped > 0) {
+    logRuntime(`[WMN] Ignored ${dropped} invalid WhatsMyName entr${dropped === 1 ? "y" : "ies"} (missing uri_check/uri_pretty).`);
+  }
+  if (valid.length === 0) {
+    logRuntime("[WMN] No usable WhatsMyName sites; platform enumeration will be skipped.");
+  }
+  return valid;
+}
+
+const WMN_SITES = loadWmnSites(WMN_PATH);
 
 function extractPageSignals(html, pageUrl) {
   const titleM =
@@ -3096,7 +3231,7 @@ async function discoverPagePdfs(pageUrls, netCtx) {
   return found.slice(0, 5);
 }
 
-async function fetchAndParsePdf(url, netCtx) {
+async function fetchAndParsePdf(url, netCtx, fullName = "") {
   try {
     const r = await sovereignFetch(
       url,
@@ -3156,8 +3291,25 @@ async function fetchAndParsePdf(url, netCtx) {
     }
     const phones = extractPublicPhones(fullScan);
 
+    // ACC-6: a multi-email PDF with no strong /Author match is a co-authorship /
+    // template document, not proof that every address belongs to the subject.
+    const authorMatchesSubject = Boolean(author && fullName && nameEvidence(author, fullName).strong);
+    const coAuthorGate = emails.length >= 2 && !authorMatchesSubject;
+
     const file_name = url.split("?")[0].split("/").pop() || "document.pdf";
-    return { url, file_name, author, creator, producer, internal_usernames, emails, phones };
+    return {
+      url,
+      file_name,
+      author,
+      creator,
+      producer,
+      internal_usernames,
+      emails,
+      phones,
+      author_matches_subject: authorMatchesSubject,
+      co_author_gate: coAuthorGate,
+      co_occurring_emails: coAuthorGate ? emails.slice() : [],
+    };
   } catch {
     return null;
   }
@@ -3290,7 +3442,21 @@ async function scanLocalCorpus(dirPath, terms) {
 // Engine 10: Local Python Sidecar Bridge (auto-prefers sidecar/.venv)
 // ---------------------------------------------------------------------------
 
+// SC-7: cache the resolved interpreter so repeated scans don't spawn
+// `--version` for every candidate. Absolute paths are re-checked for existence;
+// bare commands (e.g. "python3") are resolved through PATH at spawn time.
+const PYTHON_PATH_TTL_MS = 10 * 60 * 1000;
+let pythonPathCache = { value: null, at: 0 };
+
 function detectPythonPath() {
+  const now = Date.now();
+  if (
+    pythonPathCache.value &&
+    now - pythonPathCache.at < PYTHON_PATH_TTL_MS &&
+    (!path.isAbsolute(pythonPathCache.value) || fs.existsSync(pythonPathCache.value))
+  ) {
+    return pythonPathCache.value;
+  }
   const venvWin = path.join(SIDECAR_VENV_SCRIPTS, "python.exe");
   const venvBin3 = path.join(SIDECAR_VENV_BIN, "python3");
   const venvBin = path.join(SIDECAR_VENV_BIN, "python");
@@ -3304,10 +3470,16 @@ function detectPythonPath() {
     "python3",
     "python",
   ].filter(Boolean);
+  const seen = new Set();
   for (const c of candidates) {
+    if (seen.has(c)) continue;
+    seen.add(c);
     try {
       const r = spawnSync(c, ["--version"], { encoding: "utf8", timeout: 3000, windowsHide: true });
-      if (r.status === 0) return c;
+      if (r.status === 0) {
+        pythonPathCache = { value: c, at: now };
+        return c;
+      }
     } catch {
       // try next candidate
     }
@@ -3321,30 +3493,65 @@ function buildSidecarEnv() {
   if (binDirs.length > 0) {
     env.PATH = `${binDirs.join(path.delimiter)}${path.delimiter}${env.PATH || ""}`;
   }
+  // SC-7: a fallback system Python must still import the venv's packages.
+  const sitePackages = [];
+  const winSite = path.join(SIDECAR_VENV_DIR, "Lib", "site-packages");
+  if (fs.existsSync(winSite)) sitePackages.push(winSite);
+  const unixLib = path.join(SIDECAR_VENV_DIR, "lib");
+  try {
+    const entries = fs.existsSync(unixLib)
+      ? fs.readdirSync(unixLib, { withFileTypes: true })
+      : [];
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith("python")) continue;
+      const sp = path.join(unixLib, entry.name, "site-packages");
+      if (fs.existsSync(sp)) sitePackages.push(sp);
+    }
+  } catch {
+    // ignore unreadable venv/lib
+  }
+  if (sitePackages.length > 0) {
+    const prefix = sitePackages.join(path.delimiter);
+    env.PYTHONPATH = env.PYTHONPATH ? `${prefix}${path.delimiter}${env.PYTHONPATH}` : prefix;
+  }
   return env;
 }
 
+// SC-7: environment status polls must not spawn Python on every request.
+const SIDECAR_PROBE_TTL_MS = 60 * 1000;
+let sidecarProbeCache = { value: null, at: 0, configKey: "" };
+
 function probeSidecarTools() {
-  const py = detectPythonPath();
-  if (!py || !fs.existsSync(SIDECAR_BRIDGE)) {
-    return { python_path: py, sidecar_tools: [] };
+  const now = Date.now();
+  const configKey = `${process.env.TAUF_PYTHON || ""}|${process.env.PYTHON_EXE || ""}`;
+  if (
+    sidecarProbeCache.value &&
+    sidecarProbeCache.configKey === configKey &&
+    now - sidecarProbeCache.at < SIDECAR_PROBE_TTL_MS
+  ) {
+    return sidecarProbeCache.value;
   }
-  const r = spawnSync(py, [SIDECAR_BRIDGE, "--probe"], {
-    encoding: "utf8",
-    timeout: 9000,
-    env: buildSidecarEnv(),
-    windowsHide: true,
-  });
-  if (r.status === 0 && r.stdout) {
-    try {
-      const parsed = JSON.parse(r.stdout.trim());
-      const list = Array.isArray(parsed) ? parsed : parsed.tools || [];
-      return { python_path: py, sidecar_tools: list };
-    } catch {
-      // ignore
+  const py = detectPythonPath();
+  let result = { python_path: py, sidecar_tools: [] };
+  if (py && fs.existsSync(SIDECAR_BRIDGE)) {
+    const r = spawnSync(py, [SIDECAR_BRIDGE, "--probe"], {
+      encoding: "utf8",
+      timeout: 9000,
+      env: buildSidecarEnv(),
+      windowsHide: true,
+    });
+    if (r.status === 0 && r.stdout) {
+      try {
+        const parsed = JSON.parse(r.stdout.trim());
+        const list = Array.isArray(parsed) ? parsed : parsed.tools || [];
+        result = { python_path: py, sidecar_tools: list };
+      } catch {
+        // ignore
+      }
     }
   }
-  return { python_path: py, sidecar_tools: [] };
+  sidecarProbeCache = { value: result, at: now, configKey };
+  return result;
 }
 
 function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, netCtx, depthLevel, onEvent) {
@@ -3373,11 +3580,23 @@ function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, net
       // SC-8: let the sidecar budget its per-email work inside the Node kill cap.
       sidecar_budget_ms: sidecarTimeout,
     });
-    const child = spawn(py, [SIDECAR_BRIDGE, "--run", "--payload", payload], {
-      stdio: ["ignore", "pipe", "ignore"],
+    // SC-7: send the payload over stdin instead of argv so large payloads never
+    // hit command-line limits or show up in process listings.
+    const child = spawn(py, [SIDECAR_BRIDGE, "--run"], {
+      stdio: ["pipe", "pipe", "ignore"],
       env: buildSidecarEnv(),
       windowsHide: true,
     });
+    if (child.stdin) {
+      child.stdin.on("error", () => {
+        // EPIPE: the child may exit before draining stdin; close/error still resolves.
+      });
+      try {
+        child.stdin.end(payload);
+      } catch {
+        // ignore write-after-close races
+      }
+    }
     let buf = "";
     let timedOut = false;
     let settled = false;
@@ -3475,6 +3694,26 @@ function extractPublicPhones(text) {
   return Array.from(found);
 }
 
+/**
+ * ACC-14 / ACC-20: canonical phone identity for graph node ids.
+ * Keeps digits only, preserves a leading "+" (E.164 intent), drops an
+ * international "00" prefix and a national trunk "0". Spacing / dash / paren
+ * variants of the same number therefore share one node id (e.g.
+ * "+91 98765 43210" == "+91-98765-43210", "09876543210" == "98765 43210").
+ * Callers keep the original string as the display label.
+ */
+function canonicalPhoneId(phone) {
+  const raw = String(phone ?? "").trim();
+  if (!raw) return "";
+  const hadPlus = raw.startsWith("+");
+  let digits = raw.replace(/\D/g, "");
+  if (!digits) return "";
+  if (!hadPlus && digits.startsWith("00")) digits = digits.slice(2);
+  if (!hadPlus && digits.startsWith("0")) digits = digits.replace(/^0+/, "");
+  if (!digits) return "";
+  return `${hadPlus ? "+" : ""}${digits}`;
+}
+
 function decodeHtmlEntities(s) {
   return String(s || "")
     .replace(/&nbsp;/gi, " ")
@@ -3514,14 +3753,23 @@ function detectSearchChallenge(resp, html) {
   if (resp.status === 403) return "HTTP 403 forbidden";
   if (resp.status === 429) return "HTTP 429 rate-limited";
   if (!resp.ok) return `HTTP ${resp.status}`;
-  const titleM = html.match(/<title[^>]*>([\s\S]{1,160}?)<\/title>/i);
+  const body = String(html || "");
+  const titleM = body.match(/<title[^>]*>([\s\S]{1,160}?)<\/title>/i);
   const titleTxt = titleM ? decodeHtmlEntities(titleM[1]) : "";
   if (/^\s*(?:attention required|just a moment|captcha|blocked|forbidden|access denied|robot check)/i.test(titleTxt)) {
     return `bot challenge (${titleTxt.slice(0, 40)})`;
   }
+  // DDG serves a 200 page with an anomaly modal when it decides a client is a bot,
+  // and Brave answers with an "unusual traffic" interstitial instead of results.
+  if (/anomaly-modal|bots\s+use\s+duckduckgo\s+too|action=["'][^"']*anomaly\.js|id=["']challenge-form["']/i.test(body)) {
+    return "search engine anomaly challenge";
+  }
+  if (/unusual traffic|automated queries|too many requests from your/i.test(body)) {
+    return "search engine rate-limit interstitial";
+  }
   if (
-    /id=["']challenge-form["']|action=["'][^"']*anomaly\.js|class=["'][^"']*(?:g-recaptcha|h-captcha|cf-turnstile)|cf-challenge|verify you are human|unusual traffic from|automated queries|bot protection/i.test(
-      html
+    /class=["'][^"']*(?:g-recaptcha|h-captcha|cf-turnstile)|cf-challenge|verify you are human|bot protection/i.test(
+      body
     )
   ) {
     return "CAPTCHA / bot challenge";
@@ -3529,16 +3777,52 @@ function detectSearchChallenge(resp, html) {
   return null;
 }
 
+/**
+ * Unwrap engine redirect wrappers into the real target URL.
+ * Handles Google `/url?q=`, Yahoo `RU=`, DDG `uddg=`, Bing `/ck/a` and a
+ * generic "first encoded http(s) target" fallback. Bare URLs pass through.
+ */
 function decodeSearchRedirectUrl(href) {
   let clean = String(href || "").replace(/&amp;/g, "&").trim();
+  if (!clean) return clean;
+
+  // Decode a percent-encoded target, tolerating Yahoo's `/RK=` / `/RS=` suffix.
+  const decodeTarget = (raw) => {
+    let v = String(raw || "");
+    const cut = v.search(/\/(?:RK|RS)=/i);
+    if (cut > 0) v = v.slice(0, cut);
+    let decoded;
+    try {
+      decoded = decodeURIComponent(v);
+    } catch {
+      return "";
+    }
+    decoded = decoded.replace(/\/(?:RK|RS)=.*$/i, "").trim();
+    return /^https?:\/\//i.test(decoded) ? decoded : "";
+  };
+
+  // Google (`/url?q=`) and other wrappers that keep the target in `q=`.
+  const qM = clean.match(/[?&]q=([^&]+)/i);
+  if (qM && /(?:^https?:\/\/(?:[^/]+\.)?google\.[a-z.]+|\/url\?|^\/?url\?)/i.test(clean)) {
+    const target = decodeTarget(qM[1]);
+    if (target) return target;
+  }
+
+  // Yahoo (`/RU=<encoded>/RK=...`).
+  const ruM = clean.match(/[?&;/]RU=([^&]+)/i);
+  if (ruM) {
+    const target = decodeTarget(ruM[1]);
+    if (target) return target;
+  }
+
+  // DuckDuckGo (`uddg=`).
   const uddg = clean.match(/[?&]uddg=([^&]+)/i);
   if (uddg) {
-    try {
-      return decodeURIComponent(uddg[1]);
-    } catch {
-      return clean;
-    }
+    const target = decodeTarget(uddg[1]);
+    if (target) return target;
   }
+
+  // Bing (`/ck/a?...&u=a1<base64url>`).
   if (/bing\.com\/ck\/a/i.test(clean)) {
     const uM = clean.match(/[?&]u=([^&]+)/i);
     if (uM && uM[1].startsWith("a1")) {
@@ -3551,6 +3835,22 @@ function decodeSearchRedirectUrl(href) {
       }
     }
   }
+
+  // Generic named wrapper params (`?url=`, `?target=`, `?u=`, ...).
+  const genericM = clean.match(/[?&](?:u|url|target|dest|destination|redirect|redirect_url|to|out)=([^&]+)/i);
+  if (genericM) {
+    const target = decodeTarget(genericM[1]);
+    if (target) return target;
+  }
+
+  // Last resort for unknown wrappers: unwrap the first encoded absolute URL that
+  // sits inside the wrapper. Bare URLs with no nested target are returned as-is.
+  const hidden = clean.match(/https?%3A%2F%2F[^&"'\s]+/i);
+  if (hidden) {
+    const target = decodeTarget(hidden[0]);
+    if (target) return target;
+  }
+
   return clean;
 }
 
@@ -3688,6 +3988,46 @@ const SEARCH_ENGINES = [
   { id: "mojeek", timeoutMs: 5000, buildUrl: (q) => `https://www.mojeek.com/search?q=${encodeURIComponent(q)}` },
 ];
 
+// WP3: fallback engines earn a short cooldown after repeated failures instead of
+// being removed for the rest of the run. A single challenge/timeout is often a
+// bad circuit, so only 2 strikes trigger a ~5-minute skip; a clean parse resets.
+const ENGINE_FAILURE_STRIKES = 2;
+const ENGINE_COOLDOWN_MS = 5 * 60 * 1000;
+
+function shouldSkipEngine(record, now = Date.now()) {
+  if (!record) return false;
+  const strikes = Number(record.strikes) || 0;
+  if (strikes < ENGINE_FAILURE_STRIKES) return false;
+  const at = Number(record.at) || 0;
+  return now - at < ENGINE_COOLDOWN_MS;
+}
+
+function recordEngineFailure(engineMap, engineId, reason, now = Date.now()) {
+  if (!engineMap || typeof engineMap.get !== "function" || typeof engineMap.set !== "function") return null;
+  const prev = engineMap.get(engineId) || { reason: null, at: 0, strikes: 0 };
+  const next = {
+    reason: reason || "unknown",
+    at: now,
+    strikes: (Number(prev.strikes) || 0) + 1,
+  };
+  engineMap.set(engineId, next);
+  return next;
+}
+
+function recordEngineSuccess(engineMap, engineId, now = Date.now()) {
+  if (!engineMap || typeof engineMap.set !== "function") return null;
+  const next = { reason: null, at: now, strikes: 0 };
+  engineMap.set(engineId, next);
+  return next;
+}
+
+// A 200 OK body that parses to zero items is a parser failure, not an empty
+// result set, when the page is large enough to hold a result list.
+function isEmptyParserResult(items, html) {
+  return Array.isArray(items) && items.length === 0 && String(html || "").length > 20000;
+}
+
+
 /**
  * Resilient Startpage-over-Tor helper with up to 3 total attempts (initial + 2 retries)
  * across 3 distinct RFC 1929 IsolateSOCKSAuth circuits on BOTH challenge and timeout/network error.
@@ -3707,7 +4047,13 @@ async function queryStartpageWithRetry(query, netCtx, nextSocksUser, timeoutMs =
       const html = r.ok ? await r.text() : "";
       const challenge = detectSearchChallenge(r, html);
       if (!challenge && r.ok) {
-        return { ok: true, items: parseSearchResults("startpage", html), reason: null };
+        const items = parseSearchResults("startpage", html);
+        // Large 200 page with zero parsed rows = parser/anti-bot failure. Stop
+        // retrying this engine for the query and let the cascade fall through.
+        if (isEmptyParserResult(items, html)) {
+          return { ok: false, items: [], reason: "parser_empty" };
+        }
+        return { ok: true, items, reason: null };
       }
       lastReason = challenge || `HTTP ${r.status}`;
     } catch (err) {
@@ -3880,7 +4226,7 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
   const seenUrls = new Set();
   const seenAccountIds = new Set();
   const seenHandles = new Set();
-  const declinedEngines = new Map();
+  const declinedEngines = new Map(); // engineId -> { reason, at, strikes } (short cooldown, not a permanent ban)
   const lastEngineHitAt = new Map();
 
   const recordAccount = (acc) => {
@@ -4226,7 +4572,7 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
 
     // 2. Fallback Engines only when Startpage failed all 3 circuits for this query
     for (const eng of SEARCH_ENGINES.filter((e) => e.id !== "startpage")) {
-      if (declinedEngines.has(eng.id)) continue;
+      if (shouldSkipEngine(declinedEngines.get(eng.id))) continue;
       const lastTs = lastEngineHitAt.get(eng.id) || 0;
       const since = Date.now() - lastTs;
       if (since < 350) {
@@ -4255,17 +4601,23 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
           challenge = detectSearchChallenge(r, html);
         }
         if (challenge) {
-          declinedEngines.set(eng.id, challenge);
+          recordEngineFailure(declinedEngines, eng.id, challenge);
           out.engineNotices.push(`${eng.id}: ${challenge}`);
           continue;
         }
         const items = parseSearchResults(eng.id, html);
+        if (isEmptyParserResult(items, html)) {
+          recordEngineFailure(declinedEngines, eng.id, "parser_empty");
+          out.engineNotices.push(`${eng.id}: parser_empty`);
+          continue;
+        }
+        recordEngineSuccess(declinedEngines, eng.id);
         const engineHits = processSearchItems(eng.id, kind, items, filterPlatform);
         matchedCount += engineHits;
         if (engineHits > 0) break;
       } catch (err) {
         if (String(err?.message || "").includes("STRICT_ANONYMITY_BLOCKED")) break;
-        declinedEngines.set(eng.id, "timeout/unreachable");
+        recordEngineFailure(declinedEngines, eng.id, "timeout/unreachable");
         out.engineNotices.push(`${eng.id}: timeout`);
       }
     }
@@ -4587,15 +4939,24 @@ async function discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles,
 }
 
 /**
- * ONION-3: resolve the configured base origin for an onion engine from
- * `state.config.custom_onion_seeds` (templates with `{query}` or plain URLs),
- * falling back to the built-in v3 mirrors.
+ * ONION-3: ordered, de-duplicated list of base origins for an onion engine.
+ * Matching `state.config.custom_onion_seeds` templates (with `{query}` or plain
+ * URLs) come first; the built-in v3 mirror constants are appended as fallbacks.
  */
-function getConfiguredOnionBase(engine) {
+function getConfiguredOnionBases(engine) {
+  const isAhmia = engine === "ahmia";
+  const bases = [];
+  const seen = new Set();
+  const push = (origin) => {
+    if (typeof origin !== "string") return;
+    const norm = origin.trim().replace(/\/+$/, "");
+    if (!norm || seen.has(norm)) return;
+    seen.add(norm);
+    bases.push(norm);
+  };
   const seeds = Array.isArray(state.config?.custom_onion_seeds)
     ? state.config.custom_onion_seeds
     : [];
-  const isAhmia = engine === "ahmia";
   const matches = isAhmia
     ? [
         (host) => host.includes("ahmia"),
@@ -4610,184 +4971,336 @@ function getConfiguredOnionBase(engine) {
     try {
       const u = new URL(seed.replace(/\{query\}/g, "x"));
       const host = u.hostname.toLowerCase();
-      if (matches.some((m) => m(host))) return u.origin;
+      if (matches.some((m) => m(host))) push(u.origin);
     } catch {
       // ignore malformed seed template
     }
   }
-  return isAhmia ? AHMIA_V3_BASE : ONIONLAND_V3_BASE;
+  if (isAhmia) {
+    push(AHMIA_V3_BASE);
+    push("https://ahmia.fi");
+  } else {
+    push(ONIONLAND_V3_BASE);
+  }
+  return bases;
+}
+
+/**
+ * ONION-4: module-level Ahmia bootstrap session (hidden CSRF token + cookies).
+ * Cached for 10 minutes; values are never logged.
+ */
+let ahmiaSessionCache = { base: null, token: null, cookieHeader: "", at: 0 };
+const AHMIA_SESSION_TTL_MS = 10 * 60 * 1000;
+
+function invalidateAhmiaSession() {
+  ahmiaSessionCache = { base: null, token: null, cookieHeader: "", at: 0 };
+}
+
+/**
+ * Fetch `${base}/` only when the cache is missing, expired, or for another base.
+ * Extracts a hidden token via `extractHiddenInputs` (prefers `token|csrf` names)
+ * and builds a cookie header from every `Set-Cookie` value.
+ */
+async function ensureAhmiaSession(torHost, torPort, base, timeoutMs, socksUser) {
+  const now = Date.now();
+  if (
+    ahmiaSessionCache.base === base &&
+    ahmiaSessionCache.at > 0 &&
+    now - ahmiaSessionCache.at < AHMIA_SESSION_TTL_MS
+  ) {
+    return ahmiaSessionCache;
+  }
+  const home = await socks5hRequest(torHost, torPort, `${base}/`, {
+    timeoutMs,
+    maxBytes: 90_000,
+    jitter: false,
+    socksUser,
+  });
+  if (!home.ok) return { base, token: null, cookieHeader: "", at: 0 };
+  const homeHtml = await home.text();
+  const fields = extractHiddenInputs(homeHtml);
+  const picked = fields.find((f) => /token|csrf/i.test(f.name)) || fields[0] || null;
+  const cookieHeader = (home.headers.getSetCookie?.() || [])
+    .map((c) => String(c || "").split(";")[0].trim())
+    .filter(Boolean)
+    .join("; ");
+  ahmiaSessionCache = { base, token: picked, cookieHeader, at: now };
+  return ahmiaSessionCache;
+}
+
+/**
+ * ONION-5: every hidden `<input>` as `{name, value}`, regardless of attribute
+ * order or quote style.
+ */
+function extractHiddenInputs(html) {
+  const out = [];
+  const tagRe = /<input\b[^>]*>/gi;
+  const src = String(html || "");
+  let tag;
+  while ((tag = tagRe.exec(src))) {
+    const attrs = {};
+    const attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+    let a;
+    while ((a = attrRe.exec(tag[0]))) {
+      const key = a[1].toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(attrs, key)) continue;
+      const value = a[2] !== undefined ? a[2] : a[3] !== undefined ? a[3] : a[4] !== undefined ? a[4] : "";
+      attrs[key] = value;
+    }
+    if ((attrs.type || "").toLowerCase() !== "hidden") continue;
+    if (!attrs.name) continue;
+    out.push({ name: attrs.name, value: attrs.value || "" });
+  }
+  return out;
+}
+
+/**
+ * ONION-5: Ahmia result parser keyed on the `result` class token so extra
+ * classes on the `<li>` no longer drop every hit.
+ */
+function parseAhmiaResults(html, cleanQuery, engineLabel = "Ahmia v3") {
+  const hits = [];
+  const lis =
+    String(html || "").match(/<li\b[^>]*class=["'][^"']*\bresult\b[^"']*["'][^>]*>[\s\S]*?<\/li>/gi) || [];
+  for (const li of lis.slice(0, 15)) {
+    const h4 = li.match(/<h4[^>]*>([\s\S]*?)<\/h4>/i);
+    const cite = li.match(/<cite[^>]*>([\s\S]*?)<\/cite>/i);
+    const p = li.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
+    const aHref = li.match(/href="([^"]+)"/i);
+    let onionUrl = cite ? decodeHtmlEntities(cite[1].replace(/<[^>]+>/g, "")) : "";
+    if (aHref) {
+      const redir = aHref[1].match(/redirect_url=(https?[^&"']+)/i);
+      if (redir) {
+        try {
+          onionUrl = decodeURIComponent(redir[1]);
+        } catch {
+          // keep cite
+        }
+      }
+    }
+    if (!onionUrl || !onionUrl.includes(".onion")) continue;
+    if (!onionUrl.startsWith("http")) onionUrl = `http://${onionUrl}`;
+    if (onionUrl.includes("juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd")) continue;
+    const title = h4 ? decodeHtmlEntities(h4[1].replace(/<[^>]+>/g, " ")) : onionUrl;
+    const snippet = p ? decodeHtmlEntities(p[1].replace(/<[^>]+>/g, " ")) : "";
+    hits.push({
+      engine: engineLabel,
+      query: cleanQuery,
+      title: title.slice(0, 120),
+      url: onionUrl,
+      snippet: snippet.slice(0, 260),
+    });
+  }
+  return hits;
+}
+
+/**
+ * ONION-5: OnionLand organic parser keyed on the `result-block` class token so
+ * extra classes still parse. Sponsored/ads blocks stay filtered.
+ */
+function parseOnionLandResults(html, cleanQuery, stats = null) {
+  const hits = [];
+  const blocks = String(html || "")
+    .split(/<div\b[^>]*class=["'][^"']*\bresult-block\b[^"']*["'][^>]*>/i)
+    .slice(1);
+  for (const blk of blocks) {
+    if (/sponsored|\/ads\/click/i.test(blk.slice(0, 450))) {
+      if (stats) stats.adsFiltered = (stats.adsFiltered || 0) + 1;
+      continue;
+    }
+    const tM = blk.match(/<div class="title"[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
+    const lM = blk.match(/<div class="link"[^>]*>([\s\S]*?)<\/div>/i);
+    const dM = blk.match(/<div class="desc"[^>]*>([\s\S]*?)<\/div>/i);
+    let onionUrl = lM ? decodeHtmlEntities(lM[1].replace(/<[^>]+>/g, "")) : "";
+    if (!onionUrl || !onionUrl.includes(".onion")) continue;
+    if (!onionUrl.startsWith("http")) onionUrl = `http://${onionUrl}`;
+    const title = tM ? decodeHtmlEntities(tM[1].replace(/<[^>]+>/g, " ")) : onionUrl;
+    const snippet = dM ? decodeHtmlEntities(dM[1].replace(/<[^>]+>/g, " ")) : "";
+    hits.push({
+      engine: "OnionLand v3",
+      query: cleanQuery,
+      title: title.slice(0, 120),
+      url: onionUrl,
+      snippet: snippet.slice(0, 260),
+    });
+    if (hits.length >= 8) break;
+  }
+  return hits;
+}
+
+/**
+ * ONION-7: collapse a failed onion query into a structured reason so callers and
+ * telemetry can tell a dead circuit from a challenge or a dead parser.
+ */
+function classifyOnionFailure({ error, res, html, hitCount } = {}) {
+  if (error) {
+    const msg = String(error?.message || error);
+    return /timeout|timed out/i.test(msg) ? "timeout" : "circuit_error";
+  }
+  if (res && !res.ok) {
+    if (res.status === 403 || res.status === 429) return "challenge";
+    return "http_error";
+  }
+  if (res && res.ok) {
+    const body = typeof html === "string" ? html : "";
+    if (detectSearchChallenge(res, body)) return "challenge";
+    if (hitCount === 0 && body.length > 20000) return "parser_empty";
+    return "ok";
+  }
+  return "circuit_error";
 }
 
 /**
  * Real Ahmia v3 .onion parser over Tor SOCKS5h (with clean https://ahmia.fi over-Tor fallback):
- * Quotes multi-word names accurately, grabs rotating hidden form token + cookie,
- * and parses `<li class="result">` items cleanly.
+ * Quotes multi-word names accurately, reuses a 10-minute hidden-token/cookie session,
+ * walks configured mirrors on failure, and returns `{ hits, reason, stats }`.
  */
 async function queryAhmiaOnion(torHost, torPort, rawQuery, stats = null) {
+  const startedAt = Date.now();
+  const outStats = stats || {};
+  const bases = getConfiguredOnionBases("ahmia");
+  outStats.attempts = 0;
+  outStats.bases = bases.slice();
+  const finish = (hits, reason) => {
+    outStats.reason = reason;
+    outStats.ms = Date.now() - startedAt;
+    return { hits, reason, stats: outStats };
+  };
+
   const cleanQuery = String(rawQuery || "").replace(/^["']+|["']+$/g, "").trim();
-  if (!cleanQuery) return [];
+  if (!cleanQuery) return finish([], "ok");
   const formattedQuery = /\s/.test(cleanQuery) ? `"${cleanQuery}"` : cleanQuery;
-  const ahmiaBase = getConfiguredOnionBase("ahmia");
 
-  const queryBase = async (baseUrl, engineLabel, timeoutMs, socksUser) => {
-    const hits = [];
-    let clean = false;
-    try {
-      const home = await socks5hRequest(torHost, torPort, `${baseUrl}/`, {
-        timeoutMs,
-        maxBytes: 90_000,
-        jitter: false,
-        socksUser,
-      });
-      if (!home.ok) return { hits, clean };
-      const homeHtml = await home.text();
-      const hm = homeHtml.match(/<input[^>]+type=["']hidden["'][^>]+name=["']([^"']+)["'][^>]+value=["']([^"']+)["']/i);
-      const cookie = home.headers.get("set-cookie")?.split(";")[0] || null;
-      const searchUrl = hm
-        ? `${baseUrl}/search/?q=${encodeURIComponent(formattedQuery)}&${encodeURIComponent(hm[1])}=${encodeURIComponent(hm[2])}`
-        : `${baseUrl}/search/?q=${encodeURIComponent(formattedQuery)}`;
+  const engineLabelFor = (base) => (base.includes(".onion") ? "Ahmia v3" : "Ahmia Mirror (Tor)");
+  const searchUrlFor = (base, token) => {
+    const search = `${base}/search/?q=${encodeURIComponent(formattedQuery)}`;
+    return token
+      ? `${search}&${encodeURIComponent(token.name)}=${encodeURIComponent(token.value)}`
+      : search;
+  };
 
-      const res = await socks5hRequest(torHost, torPort, searchUrl, {
+  // ONION-4: use the cached token/cookie; on 403/429/challenge drop the cache and
+  // bootstrap exactly once more inside the same attempt.
+  const runSearch = async (base, timeoutMs, socksUser) => {
+    let session = await ensureAhmiaSession(torHost, torPort, base, timeoutMs, socksUser);
+    let res = await socks5hRequest(torHost, torPort, searchUrlFor(base, session?.token), {
+      timeoutMs,
+      maxBytes: 750_000,
+      jitter: false,
+      socksUser,
+      headers: session && session.cookieHeader ? { Cookie: session.cookieHeader } : {},
+    });
+    let html = await res.text();
+    const blocked = !res.ok
+      ? res.status === 403 || res.status === 429
+      : Boolean(detectSearchChallenge(res, html));
+    if (blocked) {
+      invalidateAhmiaSession();
+      session = await ensureAhmiaSession(torHost, torPort, base, timeoutMs, socksUser);
+      res = await socks5hRequest(torHost, torPort, searchUrlFor(base, session?.token), {
         timeoutMs,
         maxBytes: 750_000,
         jitter: false,
         socksUser,
-        headers: cookie ? { Cookie: cookie } : {},
+        headers: session && session.cookieHeader ? { Cookie: session.cookieHeader } : {},
       });
-      if (!res.ok) return { hits, clean };
-      clean = true;
-      const html = await res.text();
-      const lis = html.match(/<li class="result"[\s\S]*?<\/li>/gi) || [];
-      for (const li of lis.slice(0, 15)) {
-        const h4 = li.match(/<h4[^>]*>([\s\S]*?)<\/h4>/i);
-        const cite = li.match(/<cite[^>]*>([\s\S]*?)<\/cite>/i);
-        const p = li.match(/<p[^>]*>([\s\S]*?)<\/p>/i);
-        const aHref = li.match(/href="([^"]+)"/i);
-        let onionUrl = cite ? decodeHtmlEntities(cite[1].replace(/<[^>]+>/g, "")) : "";
-        if (aHref) {
-          const redir = aHref[1].match(/redirect_url=(https?[^&"']+)/i);
-          if (redir) {
-            try {
-              onionUrl = decodeURIComponent(redir[1]);
-            } catch {
-              // keep cite
-            }
-          }
-        }
-        if (!onionUrl || !onionUrl.includes(".onion")) continue;
-        if (!onionUrl.startsWith("http")) onionUrl = `http://${onionUrl}`;
-        if (onionUrl.includes("juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd")) continue;
-        const title = h4 ? decodeHtmlEntities(h4[1].replace(/<[^>]+>/g, " ")) : onionUrl;
-        const snippet = p ? decodeHtmlEntities(p[1].replace(/<[^>]+>/g, " ")) : "";
-        hits.push({
-          engine: engineLabel,
-          query: cleanQuery,
-          title: title.slice(0, 120),
-          url: onionUrl,
-          snippet: snippet.slice(0, 260),
-        });
-      }
-    } catch {
-      // ignore Tor circuit timeout
+      html = await res.text();
     }
-    return { hits, clean };
+    return { res, html };
   };
 
-  // Two attempts, each on a fresh Tor circuit (IsolateSOCKSAuth via socksUser):
-  // a cold rendezvous routinely exceeds one short timeout, and returning an empty
-  // array on the first slow hop silently hides every .onion hit.
+  const queryBase = async (base, timeoutMs, socksUser) => {
+    try {
+      const { res, html } = await runSearch(base, timeoutMs, socksUser);
+      const hits = res.ok ? parseAhmiaResults(html, cleanQuery, engineLabelFor(base)) : [];
+      return { hits, reason: classifyOnionFailure({ res, html, hitCount: hits.length }) };
+    } catch (error) {
+      return { hits: [], reason: classifyOnionFailure({ error, hitCount: 0 }) };
+    }
+  };
+
+  // ONION-1: two attempts on fresh Tor circuits (IsolateSOCKSAuth via socksUser);
+  // 25 s then 20 s — a single cold rendezvous silently produced 0-hit results.
+  // ONION-3: within an attempt, walk every configured base and stop only on hits
+  // or an authoritative "ok" (genuinely no results).
+  let lastReason = "circuit_error";
   for (let attempt = 0; attempt < 2; attempt++) {
     const timeoutMs = attempt === 0 ? 25000 : 20000;
     const socksUser = `tauf-onion-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    if (stats) stats.attempts = (stats.attempts || 0) + 1;
-
-    const primary = await queryBase(ahmiaBase, "Ahmia v3", timeoutMs, socksUser);
-    const hits = [...primary.hits];
-    let clean = primary.clean;
-    if (hits.length === 0) {
-      const mirror = await queryBase("https://ahmia.fi", "Ahmia Mirror (Tor)", timeoutMs, socksUser);
-      hits.push(...mirror.hits);
-      clean = clean || mirror.clean;
+    outStats.attempts = attempt + 1;
+    for (const base of bases) {
+      const outcome = await queryBase(base, timeoutMs, socksUser);
+      lastReason = outcome.reason;
+      if (outcome.hits.length > 0 || outcome.reason === "ok") return finish(outcome.hits, "ok");
     }
-    if (hits.length > 0 || clean) return hits;
-    if (stats) stats.reason = `ahmia attempt ${attempt + 1} failed`;
   }
-  return [];
+  return finish([], lastReason);
 }
 
 /**
  * Real OnionLand v3 .onion organic parser over Tor SOCKS5h:
- * Quotes multi-word names and parses organic `<div class="result-block">` items while skipping sponsored ads.
+ * Quotes multi-word names, walks configured mirrors, and parses organic
+ * `result-block` items while skipping sponsored ads. Returns `{ hits, reason, stats }`.
  */
 async function queryOnionLand(torHost, torPort, rawQuery, stats = null) {
-  const cleanQuery = String(rawQuery || "").replace(/^["']+|["']+$/g, "").trim();
-  if (!cleanQuery) return [];
-  const formattedQuery = /\s/.test(cleanQuery) ? `"${cleanQuery}"` : cleanQuery;
-  const onionLandBase = getConfiguredOnionBase("onionland");
+  const startedAt = Date.now();
+  const outStats = stats || {};
+  const bases = getConfiguredOnionBases("onionland");
+  outStats.attempts = 0;
+  outStats.bases = bases.slice();
+  outStats.adsFiltered = outStats.adsFiltered || 0;
+  const finish = (hits, reason) => {
+    outStats.reason = reason;
+    outStats.ms = Date.now() - startedAt;
+    return { hits, reason, stats: outStats };
+  };
 
-  const queryOnce = async (timeoutMs, socksUser) => {
-    const hits = [];
-    let clean = false;
+  const cleanQuery = String(rawQuery || "").replace(/^["']+|["']+$/g, "").trim();
+  if (!cleanQuery) return finish([], "ok");
+  const formattedQuery = /\s/.test(cleanQuery) ? `"${cleanQuery}"` : cleanQuery;
+
+  const queryBase = async (base, timeoutMs, socksUser) => {
     try {
-      const searchUrl = `${onionLandBase}/search?q=${encodeURIComponent(formattedQuery)}`;
+      const searchUrl = `${base}/search?q=${encodeURIComponent(formattedQuery)}`;
       const res = await socks5hRequest(torHost, torPort, searchUrl, {
         timeoutMs,
         maxBytes: 450_000,
         jitter: false,
         socksUser,
       });
-      if (!res.ok) return { hits, clean };
-      clean = true;
       const html = await res.text();
-      const blocks = html.split(/<div class="result-block">/i).slice(1);
-      for (const blk of blocks) {
-        if (/sponsored|\/ads\/click/i.test(blk.slice(0, 450))) {
-          if (stats) stats.adsFiltered++;
-          continue;
-        }
-        const tM = blk.match(/<div class="title"[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
-        const lM = blk.match(/<div class="link"[^>]*>([\s\S]*?)<\/div>/i);
-        const dM = blk.match(/<div class="desc"[^>]*>([\s\S]*?)<\/div>/i);
-        let onionUrl = lM ? decodeHtmlEntities(lM[1].replace(/<[^>]+>/g, "")) : "";
-        if (!onionUrl || !onionUrl.includes(".onion")) continue;
-        if (!onionUrl.startsWith("http")) onionUrl = `http://${onionUrl}`;
-        const title = tM ? decodeHtmlEntities(tM[1].replace(/<[^>]+>/g, " ")) : onionUrl;
-        const snippet = dM ? decodeHtmlEntities(dM[1].replace(/<[^>]+>/g, " ")) : "";
-        hits.push({
-          engine: "OnionLand v3",
-          query: cleanQuery,
-          title: title.slice(0, 120),
-          url: onionUrl,
-          snippet: snippet.slice(0, 260),
-        });
-        if (hits.length >= 8) break;
-      }
-    } catch {
-      // ignore timeout
+      const hits = res.ok ? parseOnionLandResults(html, cleanQuery, outStats) : [];
+      return { hits, reason: classifyOnionFailure({ res, html, hitCount: hits.length }) };
+    } catch (error) {
+      return { hits: [], reason: classifyOnionFailure({ error, hitCount: 0 }) };
     }
-    return { hits, clean };
   };
 
-  // Two attempts on fresh Tor circuits (IsolateSOCKSAuth); 25 s then 20 s — a single
-  // cold rendezvous below that budget produced silent 0-hit results.
+  // ONION-1: two attempts on fresh Tor circuits (IsolateSOCKSAuth); 25 s then 20 s —
+  // a single cold rendezvous below that budget produced silent 0-hit results.
+  // ONION-3: within an attempt, walk every configured base until hits or an "ok".
+  let lastReason = "circuit_error";
   for (let attempt = 0; attempt < 2; attempt++) {
     const timeoutMs = attempt === 0 ? 25000 : 20000;
     const socksUser = `tauf-onion-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    if (stats) stats.attempts = (stats.attempts || 0) + 1;
-    const result = await queryOnce(timeoutMs, socksUser);
-    if (result.hits.length > 0 || result.clean) return result.hits;
-    if (stats) stats.reason = `onionland attempt ${attempt + 1} failed`;
+    outStats.attempts = attempt + 1;
+    for (const base of bases) {
+      const outcome = await queryBase(base, timeoutMs, socksUser);
+      lastReason = outcome.reason;
+      if (outcome.hits.length > 0 || outcome.reason === "ok") return finish(outcome.hits, "ok");
+    }
   }
-  return [];
+  return finish([], lastReason);
 }
 
 /**
- * Bounded Tor socks5h:// GET inspection of a live .onion page (64KB max, 7s timeout).
+ * Bounded Tor socks5h:// GET inspection of a live .onion page (64KB max, 12s default timeout).
+ * Single landing-page fetch only: title/meta/h1/cleaned text. Never follows links or crawls.
  */
-async function fetchOnionPageSnippet(torHost, torPort, onionUrl) {
+async function fetchOnionPageSnippet(torHost, torPort, onionUrl, timeoutMs = 12000) {
   try {
     const res = await socks5hRequest(torHost, torPort, onionUrl, {
-      timeoutMs: 7000,
+      timeoutMs,
       maxBytes: 65536,
       jitter: false,
     });
@@ -4907,7 +5420,7 @@ function classifyOnionSitePurpose(combinedForSite) {
  */
 function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) {
   const cleanQuery = String(query || hit.query || "").replace(/^["']+|["']+$/g, "").trim();
-  const qType = queryType || (cleanQuery.includes("@") ? "email" : hasExactPhraseProximity(cleanQuery, fullName) ? "full_name" : "handle");
+  const qType = queryType || (cleanQuery.includes("@") ? "email" : /\s/.test(cleanQuery) ? "full_name" : "handle");
 
   let onionHost = "";
   let whereFound = "";
@@ -4921,6 +5434,7 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
     whereFound = String(hit.url || "").replace(/^https?:\/\//i, "");
   }
   if (!onionHost.includes(".onion")) return null;
+  if (!cleanQuery) return null;
 
   const isLive = Boolean(livePageData?.reachable);
   const pageStatus = isLive ? "live_verified" : "index_only";
@@ -4931,7 +5445,6 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
     : "";
   const combinedCorpus = `${indexCorpus} ${liveCorpus}`;
   const lowCombined = combinedCorpus.toLowerCase();
-  const lowIndex = indexCorpus.toLowerCase();
 
   let match_precision = null;
   let match_tier = null;
@@ -4940,7 +5453,10 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
   let searchHighlightTerm = cleanQuery;
 
   if (qType === "email") {
-    if (lowCombined.includes(cleanQuery.toLowerCase())) {
+    // Exact email only: require a true token boundary so substring fragments never match.
+    const escEmail = cleanQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const exactEmail = new RegExp(`(?:^|[^a-z0-9._%+-])${escEmail}(?:$|[^a-z0-9._%+-])`, "i");
+    if (exactEmail.test(lowCombined)) {
       match_precision = "exact";
       match_tier = "verified";
       confidence = isLive ? 0.91 : 0.86;
@@ -4949,6 +5465,7 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
       return null;
     }
   } else if (qType === "full_name") {
+    // Only a strong full-name phrase may attach; partial-name collisions are never admitted.
     if (nameEvidence(combinedCorpus, fullName).strong) {
       match_precision = "exact";
       match_tier = "verified";
@@ -4956,31 +5473,26 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
       matched_identifier = `Full Name: ${fullName}`;
       searchHighlightTerm = fullName;
     } else {
-      const parts = getNameParts(fullName);
-      const longTokens = parts.filter((p) => p.length >= 5);
-      const matchedTokens = longTokens.filter((tok) => new RegExp(`\\b${tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(lowIndex));
-      if (matchedTokens.length > 0 || (parts.length >= 2 && lowIndex.includes(parts[0]) && lowIndex.includes(parts[parts.length - 1]))) {
-        match_precision = "partial";
-        match_tier = "collision";
-        confidence = 0.42;
-        matched_identifier = `Partial Name: ${matchedTokens[0] || fullName}`;
-        searchHighlightTerm = matchedTokens[0] || parts[0] || fullName;
-      } else {
-        return null; // Drop unrelated darknet spam completely!
-      }
+      return null;
     }
   } else {
-    // handle or domain
+    // handle or domain: exact token boundary in the body AND in an identity field
+    // (title / URL host+path), unless strong name evidence independently supports the page.
+    if (cleanQuery.length < 5) return null;
     const escQ = cleanQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const exactBoundary = new RegExp(`(?:^|[^a-z0-9])${escQ}(?:$|[^a-z0-9])`, "i");
-    if (cleanQuery.length >= 4 && (exactBoundary.test(lowCombined) || (qType === "domain" && lowCombined.includes(cleanQuery.toLowerCase())))) {
-      match_precision = "handle";
-      match_tier = "probable";
-      confidence = isLive ? 0.78 : 0.72;
-      matched_identifier = qType === "domain" ? `Domain: ${cleanQuery}` : `Handle: @${cleanQuery}`;
-    } else {
-      return null; // Drop unrelated spam
-    }
+    if (!exactBoundary.test(lowCombined)) return null;
+    const identityCorpus = [hit.title, livePageData?.title, hit.url, onionHost, whereFound]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    const inIdentityField = exactBoundary.test(identityCorpus);
+    const strongName = Boolean(fullName) && nameEvidence(combinedCorpus, fullName).strong;
+    if (!inIdentityField && !strongName) return null;
+    match_precision = "handle";
+    match_tier = "probable";
+    confidence = isLive ? 0.78 : 0.72;
+    matched_identifier = qType === "domain" ? `Domain: ${cleanQuery}` : `Handle: @${cleanQuery}`;
   }
 
   const { site_category, site_purpose } = classifyOnionSitePurpose(
@@ -5014,6 +5526,185 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
 }
 
 // ---------------------------------------------------------------------------
+// Budget-driven ETA engine (WP2)
+//
+// Per-wave wall-clock budgets are the single source of truth. `etaSec()` spends
+// the current wave's remaining budget plus the RTT-scaled sum of future waves,
+// so the countdown tracks real work instead of a linear elapsed/progress guess.
+// The helpers below are deliberately free of `state` so unit tests can extract
+// and exercise them directly from this file.
+// ---------------------------------------------------------------------------
+
+const WAVE_BUDGETS_MS = {
+  1: { w1: 12000, w2: 7000, w3: 6000 },
+  2: { w1: 24000, w2: 18000, w3: 23000 },
+  3: { w1: 38000, w2: 32000, w3: 45000 },
+  4: { w1: 52000, w2: 48000, w3: 75000 },
+};
+
+// Target wall-clock per depth, kept in step with src/App.tsx DEPTH_PRESETS.
+const EST_TOTAL_SEC = { 1: 25, 2: 65, 3: 115, 4: 175 };
+
+const WAVE_KEYS = ["w1", "w2", "w3"];
+
+// Progress bands each wave spans, used to interpolate the unspent current wave.
+const WAVE_PROGRESS_BANDS = [
+  [5, 43],
+  [43, 73],
+  [73, 100],
+];
+
+function clampNumber(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.min(max, Math.max(min, n));
+}
+
+function medianRttMs(samples) {
+  const nums = Array.isArray(samples)
+    ? samples.filter((v) => typeof v === "number" && Number.isFinite(v) && v >= 0)
+    : [];
+  if (nums.length === 0) return 0;
+  const sorted = nums.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function rttFactorFromSamples(samples) {
+  return clampNumber(medianRttMs(samples) / 1800, 0.75, 1.35);
+}
+
+/**
+ * StageBudgetTracker(depthLevel, samples, expectedTotalSec)
+ *
+ * Returns a state object (callable with or without `new`) exposing:
+ *   setWave(index)            switch to wave 0/1/2 and restart the in-wave clock
+ *   etaSec(progress?)         remaining-wave ETA in whole seconds, [2 .. 300]
+ *   remainingWaveMs()         unspent time in the current wave
+ *   markTruncated(wave, tag)  record a deadline cut
+ *   getTruncations()          defensive copy of recorded cuts
+ *   onBranchDone()            progress tick hint (pure, no side effects)
+ */
+function StageBudgetTracker(depthLevel, samples, expectedTotalSec) {
+  const totalSec =
+    Number.isFinite(Number(expectedTotalSec)) && Number(expectedTotalSec) > 0
+      ? Number(expectedTotalSec)
+      : 65;
+  const budget =
+    WAVE_BUDGETS_MS[depthLevel] ||
+    WAVE_BUDGETS_MS[2] || {
+      w1: Math.round(totalSec * 0.37 * 1000),
+      w2: Math.round(totalSec * 0.28 * 1000),
+      w3: Math.round(totalSec * 0.35 * 1000),
+    };
+  const rttFactor = rttFactorFromSamples(samples);
+  const truncations = [];
+  let waveIndex = 0;
+  let waveStartedMs = Date.now();
+  let lastEtaSec = null;
+
+  function setWave(index) {
+    waveIndex = Math.max(
+      0,
+      Math.min(WAVE_KEYS.length - 1, Math.round(clampNumber(index, 0, WAVE_KEYS.length - 1)))
+    );
+    waveStartedMs = Date.now();
+  }
+
+  function remainingWaveMs() {
+    const spent = Math.max(0, Date.now() - waveStartedMs);
+    return Math.max(0, budget[WAVE_KEYS[waveIndex]] - spent);
+  }
+
+  function etaSec(progress) {
+    const p = Number(progress);
+    if (Number.isFinite(p) && p >= 100) {
+      lastEtaSec = 0;
+      return 0;
+    }
+
+    const currentKey = WAVE_KEYS[waveIndex];
+    const currentBudgetMs = budget[currentKey];
+    const timeRemainingMs = remainingWaveMs();
+    let remainingCurrentMs = timeRemainingMs;
+
+    if (Number.isFinite(p)) {
+      const band = WAVE_PROGRESS_BANDS[waveIndex] || [0, 100];
+      const span = Math.max(1, band[1] - band[0]);
+      const doneFrac = clampNumber((p - band[0]) / span, 0, 1);
+      remainingCurrentMs = Math.min(timeRemainingMs, currentBudgetMs * (1 - doneFrac));
+    }
+
+    let futureMs = 0;
+    for (let i = waveIndex + 1; i < WAVE_KEYS.length; i++) {
+      futureMs += budget[WAVE_KEYS[i]];
+    }
+
+    const rawSec = (remainingCurrentMs + futureMs * rttFactor) / 1000;
+    let eta = Math.max(2, Math.min(300, Math.round(rawSec)));
+    // Monotonic smoothing: a re-ordered stage may never inflate the countdown.
+    if (lastEtaSec !== null) eta = Math.min(eta, lastEtaSec + 3);
+    eta = Math.max(2, eta);
+    lastEtaSec = eta;
+    return eta;
+  }
+
+  function markTruncated(wave, detail) {
+    const entry = {
+      wave: Number.isFinite(Number(wave)) ? Number(wave) : waveIndex,
+      detail: String(detail || ""),
+      at: new Date().toISOString(),
+    };
+    truncations.push(entry);
+    return entry;
+  }
+
+  function getTruncations() {
+    return truncations.map((t) => ({ ...t }));
+  }
+
+  function onBranchDone() {
+    return { progressDelta: 2 };
+  }
+
+  return {
+    setWave,
+    etaSec,
+    remainingWaveMs,
+    markTruncated,
+    getTruncations,
+    onBranchDone,
+    getWave: () => waveIndex,
+    rttFactor,
+    budget,
+  };
+}
+
+/**
+ * Resolve with `promise`'s value, or with a safe fallback after `ms`.
+ * Only use for branches whose partial/empty result cannot corrupt the graph.
+ */
+function withDeadline(promise, ms, fallbackFactory, label) {
+  const waitMs = Math.max(1, Number(ms) || 1);
+  let timer = null;
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      let fallback;
+      try {
+        fallback = typeof fallbackFactory === "function" ? fallbackFactory() : fallbackFactory;
+      } catch {
+        fallback = undefined;
+      }
+      resolve(fallback);
+    }, waitMs);
+    if (timer && typeof timer.unref === "function") timer.unref();
+  });
+  return Promise.race([Promise.resolve(promise), deadline]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Full Sovereign V4 Investigation Pipeline (Name-Root, 4-Level Depth + ETA)
 // ---------------------------------------------------------------------------
 
@@ -5027,15 +5718,13 @@ async function runInvestigation(caseId, input, auth) {
   const startedMs = Date.now();
   const depthLevel = Math.max(1, Math.min(4, Number(input.depth_level || 2)));
   try {
-  const estTotalSec = { 1: 22, 2: 65, 3: 115, 4: 185 }[depthLevel] || 65;
+  const estTotalSec = EST_TOTAL_SEC[depthLevel] || 65;
+  const tracker = new StageBudgetTracker(depthLevel, getRttSamples(), estTotalSec);
+  tracker.setWave(0);
 
   const emitStage = (stage, message, progress) => {
     const elapsedSec = Math.max(0, Math.round((Date.now() - startedMs) / 1000));
-    let etaSec = 0;
-    if (progress < 100) {
-      const rateEst = progress >= 15 ? Math.round((elapsedSec / progress) * (100 - progress)) : Math.round((estTotalSec * (100 - progress)) / 100);
-      etaSec = Math.max(2, Math.min(300, Math.round((rateEst + (estTotalSec * (100 - progress)) / 100) / 2)));
-    }
+    const etaSec = progress >= 100 ? 0 : tracker.etaSec(progress);
     broadcastEvent({
       kind: "stage",
       case_id: caseId,
@@ -5047,11 +5736,12 @@ async function runInvestigation(caseId, input, auth) {
       depth_level: depthLevel,
     });
   };
-  const emitTool = (tool, toolState, hits, detail) => {
+  const emitTool = (tool, toolState, hits, detail, extra = null) => {
     const status = { tool, state: toolState, hits, detail };
+    if (extra && typeof extra === "object") Object.assign(status, extra);
     upsertToolRun(snap, status);
     snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
-    broadcastEvent({ kind: "tool_status", case_id: caseId, ...status });
+    broadcastEvent({ kind: "tool_status", case_id: caseId, ...status, stats: snap.stats });
   };
   const isQuarantinedNodeId = (id) =>
     snap.nodes.some((n) => n.id === id && n.status === "quarantined");
@@ -5063,7 +5753,7 @@ async function runInvestigation(caseId, input, auth) {
     }
     const merged = upsertNode(snap, next);
     snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
-    broadcastEvent({ kind: "node", case_id: caseId, node: merged });
+    broadcastEvent({ kind: "node", case_id: caseId, node: merged, stats: snap.stats });
     return merged;
   };
   const addEdge = (source, target, relation, confidence, tool) => {
@@ -5077,13 +5767,13 @@ async function runInvestigation(caseId, input, auth) {
       confidence,
       sources: [tool],
     });
-    broadcastEvent({ kind: "edge", case_id: caseId, edge });
+    broadcastEvent({ kind: "edge", case_id: caseId, edge, stats: snap.stats });
   };
   const addFinding = (finding) => {
     if (finding?.node_id && isQuarantinedNodeId(finding.node_id)) return;
     const merged = upsertFinding(snap, finding);
     snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
-    broadcastEvent({ kind: "finding", case_id: caseId, finding: merged });
+    broadcastEvent({ kind: "finding", case_id: caseId, finding: merged, stats: snap.stats });
   };
 
   const now = new Date().toISOString();
@@ -5296,7 +5986,7 @@ async function runInvestigation(caseId, input, auth) {
   if (input.phone?.trim()) {
     const ph = input.phone.trim();
     trackPhone(ph);
-    const phId = normalizeNodeId("phone", ph);
+    const phId = normalizeNodeId("phone", canonicalPhoneId(ph) || ph);
     addNode({
       id: phId,
       kind: "phone",
@@ -5388,12 +6078,43 @@ async function runInvestigation(caseId, input, auth) {
   const webDiscoveredSites = [];
   const verifiedHandlesPriority = [];
 
-  const [socialWebRes, pubRecordsRes] = await Promise.all([
-    discoverSocialAndWeb(fullName, netCtx, depthLevel, knownHandles),
-    depthLevel >= 2
-      ? discoverPublicRecords(fullName, netCtx, depthLevel)
-      : Promise.resolve({ records: [], pdfLinks: [] }),
-  ]);
+  let stage0aTruncated = false;
+  const [socialWebRes, pubRecordsRes] = await withDeadline(
+    Promise.all([
+      discoverSocialAndWeb(fullName, netCtx, depthLevel, knownHandles),
+      depthLevel >= 2
+        ? discoverPublicRecords(fullName, netCtx, depthLevel)
+        : Promise.resolve({ records: [], pdfLinks: [] }),
+    ]),
+    Math.max(6000, tracker.remainingWaveMs()),
+    () => {
+      stage0aTruncated = true;
+      tracker.markTruncated(0, "stage0a:social_web+public_records");
+      logRuntime(`[Investigation ${caseId}] stage0a hit the Wave 1 deadline — continuing with partial discovery`);
+      return [
+        {
+          accounts: [],
+          handles: [],
+          emails: [],
+          phones: [],
+          records: [],
+          websites: [],
+          pdfs: [],
+          engineNotices: [],
+        },
+        { records: [], pdfLinks: [] },
+      ];
+    },
+    "stage0a"
+  );
+  // Sub-stage tick: the two independent discovery branches above are done.
+  emitStage(
+    "web_social",
+    stage0aTruncated
+      ? "Social/web discovery hit the wave deadline — continuing with partial evidence"
+      : "Social/web & public-record discovery returned — merging evidence",
+    15
+  );
 
   let webSocialHits = 0;
   const confirmedProfileUrls = [];
@@ -5486,7 +6207,7 @@ async function runInvestigation(caseId, input, auth) {
   }
   for (const ph of socialWebRes.phones) {
     if (trackPhone(ph)) {
-      const phId = normalizeNodeId("phone", ph);
+      const phId = normalizeNodeId("phone", canonicalPhoneId(ph) || ph);
       addNode({
         id: phId,
         kind: "phone",
@@ -6487,6 +7208,11 @@ async function runInvestigation(caseId, input, auth) {
   }
 
   // -------------------------------------------------------------------------
+  // Wave 2: Multi-Hop Enrichment & Pivot (DNS/TLS/Gravatar + WMN + corroboration)
+  // -------------------------------------------------------------------------
+  tracker.setWave(1);
+
+  // -------------------------------------------------------------------------
   // Stage 1B: Direct DNS (MX/SPF/DMARC), TLS X.509 Cert Inspector & Gravatar HEAD
   // -------------------------------------------------------------------------
   emitStage("dns_gravatar", "Inspecting domain DNS, TLS X.509 certs & Gravatar hashes", 42);
@@ -6609,7 +7335,11 @@ async function runInvestigation(caseId, input, auth) {
   // -------------------------------------------------------------------------
   const wmnSiteLimit = depthLevel === 1 ? 25 : WMN_SITES.length;
   const wmnHandleLimit = { 1: 2, 2: 3, 3: 4, 4: 5 }[depthLevel] || 3;
-  const wmnBudgetMs = { 1: 12_000, 2: 20_000, 3: 28_000, 4: 35_000 }[depthLevel] || 20_000;
+  const wmnTierBudgetMs = { 1: 12_000, 2: 20_000, 3: 28_000, 4: 35_000 }[depthLevel] || 20_000;
+  // OPT-07: each handle sweep is capped by the tier budget AND whatever is left
+  // of the Wave 1 envelope — no hard promise race needed (runWmnForHandle obeys
+  // budgetMs internally and returns the hits collected so far).
+  const wmnBudgetMs = Math.max(4000, Math.min(wmnTierBudgetMs, tracker.remainingWaveMs()));
   emitStage("wmn", `Checking ${wmnSiteLimit} calibrated platforms (L${depthLevel} depth, zero-canary FP)`, 54);
   emitTool("wmn-native", "running", 0, `Scanning ${wmnSiteLimit} verified sites across ${Math.min(wmnHandleLimit, knownHandles.length)} handle(s)`);
   const wmnHandles = knownHandles.slice(0, wmnHandleLimit);
@@ -6754,6 +7484,8 @@ async function runInvestigation(caseId, input, auth) {
     wmnCorroborated + wmnCollisions,
     `${wmnCorroborated} corroborated, ${wmnCollisions} collision lead(s)`
   );
+  // Sub-stage tick: primary handle sweep (independent branch) finished.
+  emitStage("wmn", "Primary handle sweep finished — corroborating cross-platform evidence", 60);
 
   // -------------------------------------------------------------------------
   // Stage 2A: Cross-Account Avatar SHA-256 & Reciprocal Link Corroboration
@@ -6954,7 +7686,7 @@ async function runInvestigation(caseId, input, auth) {
       }
       for (const ph of data.phones || []) {
         if (trackPhone(ph)) {
-          const phId = normalizeNodeId("phone", ph);
+          const phId = normalizeNodeId("phone", canonicalPhoneId(ph) || ph);
           addNode({
             id: phId,
             kind: "phone",
@@ -7058,7 +7790,7 @@ async function runInvestigation(caseId, input, auth) {
   if (docPdfCap > 0) {
     for (const pdfUrl of discoveredPdfUrls.slice(0, docPdfCap)) {
       const searchMeta = pdfMetaMap.get(pdfUrl) || null;
-      const meta = await fetchAndParsePdf(pdfUrl, netCtx);
+      const meta = await fetchAndParsePdf(pdfUrl, netCtx, fullName);
       const pInfo = pdfParentMap.get(pdfUrl);
       const isArxivPdf = pInfo?.relation === "has_pdf";
       const isSearchVerified = Boolean(searchMeta?.verifiedFromSearch);
@@ -7180,26 +7912,39 @@ async function runInvestigation(caseId, input, auth) {
       }
       for (const em of meta?.emails || []) {
         const emId = normalizeNodeId("email", em);
+        // ACC-6: co-author gate. With >=2 embedded emails and no strong /Author
+        // match, only an already-known subject address stays a verified anchor;
+        // the rest are marked co_occurring and never feed trackEmail (so they do
+        // not become holehe/ignorant parents for the subject).
+        const knownSubjectEmail = knownEmails.includes(String(em || "").trim().toLowerCase());
+        const coOccurring = Boolean(meta?.co_author_gate) && !knownSubjectEmail;
         addNode({
           id: emId,
           kind: "email",
           label: em,
-          sublabel: "Embedded PDF Email",
-          layer: "anchor",
-          confidence: 0.86,
+          sublabel: coOccurring ? "Co-occurring PDF Email" : "Embedded PDF Email",
+          layer: coOccurring ? "deep" : "anchor",
+          confidence: coOccurring ? 0.6 : 0.86,
           status: "unverified",
           sources: ["doc-meta"],
-          metadata: { match_tier: "verified", match_reason: "Embedded PDF email" },
+          metadata: coOccurring
+            ? {
+                match_tier: "probable",
+                match_reason: "Co-occurring PDF email — no strong /Author match",
+                co_occurring: true,
+              }
+            : { match_tier: "verified", match_reason: "Embedded PDF email" },
+          ...(coOccurring ? { co_occurring: true } : {}),
           url: pdfUrl,
           depth: docDepth + 1,
         });
-        addEdge(docId, emId, "pdf_author_email", 0.86, "doc-meta");
-        trackEmail(em);
+        addEdge(docId, emId, "pdf_author_email", coOccurring ? 0.6 : 0.86, "doc-meta");
+        if (!coOccurring) trackEmail(em);
         docHits++;
       }
       for (const ph of meta?.phones || []) {
         if (trackPhone(ph)) {
-          const phId = normalizeNodeId("phone", ph);
+          const phId = normalizeNodeId("phone", canonicalPhoneId(ph) || ph);
           addNode({
             id: phId,
             kind: "phone",
@@ -7241,9 +7986,17 @@ async function runInvestigation(caseId, input, auth) {
   ];
 
   const seenOnions = new Set();
-  const onionLiveProbesUsed = { count: 0 };
+  const onionNotices = [];
 
-  const admitClassifiedOnion = async (rawHit, query, queryType, parentNodeId, sourceTool) => {
+  const admitClassifiedOnion = async (
+    rawHit,
+    query,
+    queryType,
+    parentNodeId,
+    sourceTool,
+    livePageData = null,
+    preCheck = undefined
+  ) => {
     const canonUrl = normUrlForMatch(rawHit.url);
     if (!canonUrl || !canonUrl.includes(".onion")) return "filtered";
     const onionId = normalizeNodeId("onion", rawHit.url);
@@ -7257,16 +8010,17 @@ async function runInvestigation(caseId, input, auth) {
       return "duplicate";
     }
 
-    // Pre-screen with index data first so we don't spend live Tor probes on obvious spam
-    const preCheck = classifyOnionHit(rawHit, query, queryType, fullName, null);
-    let livePageData = null;
-    if (tor.available && onionLiveProbesUsed.count < 5 && (preCheck !== null || onionLiveProbesUsed.count < 2)) {
-      onionLiveProbesUsed.count++;
-      livePageData = await fetchOnionPageSnippet(tor.host, tor.port, rawHit.url);
-    }
+    // False-positive gate: index-level verdict is authoritative for admission. Callers may
+    // supply a precomputed preCheck; otherwise derive it here from index data only.
+    const indexVerdict =
+      preCheck === undefined
+        ? classifyOnionHit(rawHit, query, queryType, fullName, null)
+        : preCheck;
+    if (indexVerdict === null) return "filtered";
 
+    // Live probing happens upstream (Stage 3A); here we only classify with supplied data.
     const classified = classifyOnionHit(rawHit, query, queryType, fullName, livePageData);
-    if (!classified) return "filtered"; // Dropped unrelated darknet spam!
+    if (!classified || classified.match_tier === "collision") return "filtered";
 
     seenOnions.add(canonUrl);
     const parentId =
@@ -7322,6 +8076,11 @@ async function runInvestigation(caseId, input, auth) {
     return "admitted";
   };
 
+  // -------------------------------------------------------------------------
+  // Wave 3: Exposure Audit & Corroboration (Tor search, corpus, sidecars)
+  // -------------------------------------------------------------------------
+  tracker.setWave(2);
+
   if (input.enable_tor) {
     emitStage("tor_darkweb", "Searching live Tor .onion indexes (Ahmia v3 + OnionLand v3) & paste/leak indexes", 82);
     emitTool("tor-socks5h", "running", 0, "Querying Ahmia v3, OnionLand v3 & paste/leak indexes over socks5h://");
@@ -7358,44 +8117,126 @@ async function runInvestigation(caseId, input, auth) {
           : Promise.resolve([]);
 
       for (const qObj of queriesToRun) {
-        const [ahmiaHits, olHits] = await Promise.all([
+        const [ahmiaRes, olRes] = await Promise.all([
           queryAhmiaOnion(tor.host, tor.port, qObj.query, darkStats),
           queryOnionLand(tor.host, tor.port, qObj.query, darkStats),
         ]);
-        for (const h of [...ahmiaHits, ...olHits]) {
+        if (ahmiaRes.reason !== "ok") onionNotices.push(`ahmia: ${ahmiaRes.reason}`);
+        if (olRes.reason !== "ok") onionNotices.push(`onionland: ${olRes.reason}`);
+        for (const h of [...ahmiaRes.hits, ...olRes.hits]) {
           rawCandidates.push({ hit: h, queryObj: qObj });
         }
       }
 
-      // Prioritize exact/email/full_name matches and non-spam hits first before live Tor probing
-      rawCandidates.sort((a, b) => {
-        const score = (c) => {
-          const pre = classifyOnionHit(c.hit, c.queryObj.query, c.queryObj.queryType, fullName, null);
-          if (!pre) return 0;
-          return pre.match_precision === "exact" ? 3 : pre.match_precision === "handle" ? 2 : 1;
+      // ONION-6: de-duplicate candidates by canonical URL and keep the strongest signal
+      // (highest precision, then best query type), pre-checking each with index data only.
+      const precisionRank = (precision) =>
+        precision === "exact" ? 3 : precision === "handle" ? 2 : precision === "partial" ? 1 : 0;
+      const queryTypeRank = (qType) =>
+        qType === "email" ? 4 : qType === "full_name" ? 3 : qType === "domain" ? 2 : 1;
+      const candidateByUrl = new Map();
+      for (const cand of rawCandidates) {
+        const canonUrl = normUrlForMatch(cand.hit.url);
+        if (!canonUrl || !canonUrl.includes(".onion")) continue;
+        const pre = classifyOnionHit(
+          cand.hit,
+          cand.queryObj.query,
+          cand.queryObj.queryType,
+          fullName,
+          null
+        );
+        const entry = {
+          hit: cand.hit,
+          queryObj: cand.queryObj,
+          preCheck: pre,
+          canonUrl,
+          precisionScore: pre ? precisionRank(pre.match_precision) : -1,
+          queryScore: queryTypeRank(cand.queryObj.queryType),
         };
-        return score(b) - score(a);
-      });
+        const existing = candidateByUrl.get(canonUrl);
+        if (!existing) {
+          candidateByUrl.set(canonUrl, entry);
+          continue;
+        }
+        const stronger =
+          entry.precisionScore > existing.precisionScore ||
+          (entry.precisionScore === existing.precisionScore &&
+            entry.queryScore > existing.queryScore);
+        if (stronger) candidateByUrl.set(canonUrl, entry);
+      }
+
+      // Drop index-level false positives BEFORE any probe budget is spent.
+      const rankedCandidates = Array.from(candidateByUrl.values())
+        .filter((cand) => cand.preCheck !== null)
+        .sort(
+          (a, b) =>
+            b.precisionScore - a.precisionScore ||
+            b.queryScore - a.queryScore ||
+            String(a.hit.engine || "").localeCompare(String(b.hit.engine || "")) ||
+            a.canonUrl.localeCompare(b.canonUrl)
+        );
 
       const maxOnionHits = depthLevel >= 3 ? 16 : 10;
+      const PROBE_LIMIT = 5;
+      const PROBE_TIMEOUT_MS = 12000;
+      const STAGE_DEADLINE_MS = 15000;
+
+      // ONION-2: reserve up to 5 top-ranked candidates atomically (seenOnions.add BEFORE
+      // awaiting) so concurrent sidecar events can never double-probe the same .onion.
+      const probeQueue = [];
+      for (const cand of rankedCandidates.slice(0, maxOnionHits)) {
+        if (probeQueue.length >= PROBE_LIMIT) break;
+        if (seenOnions.has(cand.canonUrl)) continue;
+        seenOnions.add(cand.canonUrl);
+        probeQueue.push(cand);
+      }
+
+      // Probe the reserved candidates in parallel, single landing page each. A 15 s stage
+      // deadline keeps a hung circuit from blocking the rest of the investigation.
+      const probeResults = new Map();
+      if (probeQueue.length > 0) {
+        let deadlineTimer = null;
+        const deadline = new Promise((resolve) => {
+          deadlineTimer = setTimeout(() => resolve(null), STAGE_DEADLINE_MS);
+        });
+        const allProbes = Promise.allSettled(
+          probeQueue.map((cand) =>
+            fetchOnionPageSnippet(tor.host, tor.port, cand.hit.url, PROBE_TIMEOUT_MS)
+          )
+        );
+        const settled = await Promise.race([allProbes, deadline]);
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+        if (Array.isArray(settled)) {
+          settled.forEach((result, idx) => {
+            if (result.status === "fulfilled" && result.value) {
+              probeResults.set(probeQueue[idx].canonUrl, result.value);
+            }
+          });
+        }
+      }
+
+      // Admit in rank order: probed candidates use livePageData, the rest index-only.
+      // Candidates already admitted elsewhere merge sources inside admitClassifiedOnion.
       let torHits = 0;
       let spamRejected = 0;
       const seenSpamUrls = new Set();
-      for (const cand of rawCandidates) {
+      for (const cand of rankedCandidates) {
         if (torHits >= maxOnionHits) break;
+        const livePageData = probeResults.get(cand.canonUrl) || null;
         const outcome = await admitClassifiedOnion(
           cand.hit,
           cand.queryObj.query,
           cand.queryObj.queryType,
           cand.queryObj.parentNodeId,
-          "tor-socks5h"
+          "tor-socks5h",
+          livePageData,
+          cand.preCheck
         );
         if (outcome === "admitted") {
           torHits++;
         } else if (outcome === "filtered") {
-          const cu = normUrlForMatch(cand.hit.url);
-          if (!seenSpamUrls.has(cu)) {
-            seenSpamUrls.add(cu);
+          if (!seenSpamUrls.has(cand.canonUrl)) {
+            seenSpamUrls.add(cand.canonUrl);
             spamRejected++;
           }
         }
@@ -7465,16 +8306,21 @@ async function runInvestigation(caseId, input, auth) {
       const exitSuffix = state.torExitIp ? ` · exit ${state.torExitIp}` : "";
       const pasteSuffix = depthLevel >= 2 ? ` + ${pasteHits} paste/leak hit(s)` : "";
       const enginesLabel = depthLevel >= 2 ? "Ahmia v3, OnionLand v3 & Paste/Leak indexes" : "Ahmia v3 & OnionLand v3";
+      const uniqueNotices = Array.from(new Set(onionNotices));
+      const noticeSuffix = uniqueNotices.length ? ` · notices: ${uniqueNotices.join("; ")}` : "";
       emitTool(
         "tor-socks5h",
         "done",
         torHits + pasteHits,
-        `Searched ${enginesLabel} across ${queriesToRun.length} term(s) — ${torHits} relevant .onion hit(s)${pasteSuffix} (${filteredCount} spam/ads filtered)${exitSuffix}`
+        `Searched ${enginesLabel} across ${queriesToRun.length} term(s) — ${torHits} relevant .onion hit(s)${pasteSuffix} (${filteredCount} spam/ads filtered)${exitSuffix}${noticeSuffix}`,
+        { engine_notices: uniqueNotices }
       );
     }
   } else {
     emitTool("tor-socks5h", "skipped", 0, "Tor toggle OFF");
   }
+
+  snap.engine_notices = Array.from(new Set(onionNotices));
 
   // -------------------------------------------------------------------------
   // Stage 3B: Always-Armed Local Sovereign Corpus Scanner
@@ -7818,7 +8664,7 @@ async function runDeepenNode(caseId, nodeId) {
     match_tier: "verified",
     match_reason: "Operator confirmed anchor",
   };
-  broadcastEvent({ kind: "node", case_id: caseId, node });
+  broadcastEvent({ kind: "node", case_id: caseId, node, stats: snap.stats });
 
   // PR-2: same proxy resolution as runInvestigation (Tor first, then custom proxy).
   const netCtx = await resolveNetContext(state.config, snap.input || {});
@@ -7850,7 +8696,8 @@ async function runDeepenNode(caseId, nodeId) {
       next.status = "quarantined";
     }
     const m = upsertNode(snap, next);
-    broadcastEvent({ kind: "node", case_id: caseId, node: m });
+    snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
+    broadcastEvent({ kind: "node", case_id: caseId, node: m, stats: snap.stats });
   };
   const addEdge = (s, t, rel, conf, src) => {
     if (!s || !t || s === t) return;
@@ -7863,12 +8710,13 @@ async function runDeepenNode(caseId, nodeId) {
       confidence: conf,
       sources: [src],
     });
-    broadcastEvent({ kind: "edge", case_id: caseId, edge: e });
+    broadcastEvent({ kind: "edge", case_id: caseId, edge: e, stats: snap.stats });
   };
   const addFinding = (f) => {
     if (f?.node_id && isQuarantinedNodeId(f.node_id)) return;
     const m = upsertFinding(snap, f);
-    broadcastEvent({ kind: "finding", case_id: caseId, finding: m });
+    snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
+    broadcastEvent({ kind: "finding", case_id: caseId, finding: m, stats: snap.stats });
   };
 
   if (node.kind === "handle" || (node.kind === "account" && normalizePlatformSlug(node.metadata?.platform) === "github")) {

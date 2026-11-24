@@ -40,8 +40,8 @@ const DEPTH_PRESETS: Array<{
     level: 1,
     label: "Quick",
     short: "L1 Quick",
-    est: "~20s",
-    estSeconds: 20,
+    est: "~25s",
+    estSeconds: 25,
     hint: "Fast surface check across primary handles and direct profiles",
   },
   {
@@ -49,7 +49,7 @@ const DEPTH_PRESETS: Array<{
     label: "Standard",
     short: "L2 Standard",
     est: "~1m",
-    estSeconds: 60,
+    estSeconds: 65,
     hint: "Balanced multi-source sweep: social, web, contacts, services & Tor",
   },
   {
@@ -57,15 +57,15 @@ const DEPTH_PRESETS: Array<{
     label: "Deep",
     short: "L3 Deep",
     est: "~2m",
-    estSeconds: 120,
+    estSeconds: 115,
     hint: "Expanded social, legal/corporate records, PDFs, services & Tor search",
   },
   {
     level: 4,
     label: "Max",
     short: "L4 Max",
-    est: "~3m+",
-    estSeconds: 200,
+    est: "~3m",
+    estSeconds: 175,
     hint: "Exhaustive multi-pass sweep across every local engine, PDF & Tor seed",
   },
 ];
@@ -333,22 +333,32 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    let retryTimer: number | undefined;
-    void refreshEnvironment().then((env) => {
-      // If Tor is still bootstrapping on startup, re-probe once smoothly
-      if (env && !env.tor_socks_available && inTauri) {
-        retryTimer = window.setTimeout(() => {
-          void refreshEnvironment();
-        }, 4500);
-      }
-    });
+    let pollTimer: number | undefined;
+    let cancelled = false;
+    let attempts = 0;
+    // Cold start: Tor often needs 15-30s to bootstrap after the app opens. Poll
+    // every 2s for up to 30s until a SOCKS listener is reported, then stop.
+    const POLL_MS = 2000;
+    const MAX_ATTEMPTS = 15;
+    const pollEnvironment = async () => {
+      const env = await refreshEnvironment();
+      if (cancelled) return;
+      attempts += 1;
+      const torReady = Boolean(env && (env.tor_socks_available || env.anonymity_active));
+      if (torReady || !inTauri || attempts >= MAX_ATTEMPTS) return;
+      pollTimer = window.setTimeout(() => {
+        void pollEnvironment();
+      }, POLL_MS);
+    };
+    void pollEnvironment();
     void refreshCases();
     void getAuthConfig()
       .then((cfg) => setAuthConfig(cfg))
       .catch(() => {});
 
     return () => {
-      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+      cancelled = true;
+      if (pollTimer !== undefined) window.clearTimeout(pollTimer);
     };
   }, [refreshEnvironment, refreshCases, inTauri]);
 

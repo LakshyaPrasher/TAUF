@@ -16,6 +16,7 @@ src-tauri/target/
 reports/
 *.log
 output_*.txt
+tests/integration/last-run.json
 
 # Environment & secrets
 .env

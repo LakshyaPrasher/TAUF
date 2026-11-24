@@ -922,7 +922,7 @@ export function IdentityGraph({
         );
         layout.on("layoutstop", () => syncRadarPoints());
         layout.run();
-      }, 90);
+      }, 150);
     } else {
       syncRadarPoints();
     }

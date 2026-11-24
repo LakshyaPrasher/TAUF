@@ -2,9 +2,9 @@
 /**
  * TAUF — one-command verification runner
  * --------------------------------------
- * Runs the unit, server/API, and integration suites sequentially and prints a
- * consolidated summary. Each suite is a standalone Node script that exits
- * non-zero on failure.
+ * Runs the unit, transport, onion, server/API, and integration suites sequentially
+ * and prints a consolidated summary. Each suite is a standalone Node script that
+ * exits non-zero on failure.
  *
  *   node tests/run-all.mjs
  *   node tests/run-all.mjs --only=unit,server
@@ -18,6 +18,10 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const SUITES = [
   { id: "unit", label: "Unit / pure functions", file: "tests/unit/functions.test.mjs", timeout: 120_000 },
+  { id: "transport", label: "Unit / SOCKS5h transport", file: "tests/unit/transport.test.mjs", timeout: 120_000 },
+  { id: "onion", label: "Unit / .onion reliability", file: "tests/unit/onion.test.mjs", timeout: 120_000 },
+  { id: "eta", label: "Unit / ETA & budget engine", file: "tests/unit/eta.test.mjs", timeout: 120_000 },
+  { id: "search", label: "Unit / search cascade reliability", file: "tests/unit/search.test.mjs", timeout: 120_000 },
   { id: "server", label: "Server / API integration", file: "tests/server/api.test.mjs", timeout: 180_000 },
   {
     id: "integration",

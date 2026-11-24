@@ -757,7 +757,9 @@ def run_sidecar(payload: dict[str, Any]) -> None:
                 }
             )
 
-            def _scan_maigret_handle(h: str) -> list[tuple[str, dict[str, Any]]]:
+            def _scan_maigret_handle(
+                h: str,
+            ) -> tuple[list[tuple[str, dict[str, Any]]], int, list[str]]:
                 argv = [
                     "maigret", h,
                     "--top-sites", maigret_top,
@@ -768,16 +770,24 @@ def run_sidecar(payload: dict[str, Any]) -> None:
                     argv.extend(["--proxy", active_proxy])
                 code = f"import sys; sys.argv = {json.dumps(argv)}; from maigret.maigret import run; run()"
                 # CRITICAL: clean env with NO ALL_PROXY so aiohttp_socks uses --proxy socks5h:// cleanly!
-                _, lines = stream_python_code(code, build_clean_env(None), timeout=maigret_timeout)
-                return [(h, item) for item in parse_maigret_lines(lines)]
+                rc, lines = stream_python_code(code, build_clean_env(None), timeout=maigret_timeout)
+                return ([(h, item) for item in parse_maigret_lines(lines)], rc, lines)
 
-            if len(target_handles) == 1:
-                raw_results = _scan_maigret_handle(target_handles[0])
-            else:
-                raw_results = []
+            scan_batches = (
+                [_scan_maigret_handle(target_handles[0])]
+                if len(target_handles) == 1
+                else []
+            )
+            if len(target_handles) > 1:
                 with ThreadPoolExecutor(max_workers=len(target_handles)) as hpool:
-                    for batch in hpool.map(_scan_maigret_handle, target_handles):
-                        raw_results.extend(batch)
+                    scan_batches = list(hpool.map(_scan_maigret_handle, target_handles))
+
+            raw_results: list[tuple[str, dict[str, Any]]] = []
+            scan_failures: list[tuple[int, list[str]]] = []
+            for batch_hits, rc, lines in scan_batches:
+                raw_results.extend(batch_hits)
+                if rc != 0:
+                    scan_failures.append((rc, lines))
 
             prepared: list[tuple[int, dict[str, Any]]] = []
             seen_urls: set[str] = set()
@@ -859,6 +869,26 @@ def run_sidecar(payload: dict[str, Any]) -> None:
             emitted_items = [ev for _, ev in prepared[:cap]]
             for ev in emitted_items:
                 emit(ev)
+            # Never report a killed/failed scan as a clean 0-hit run; keep the
+            # parsed hits above and surface a short error tail instead.
+            if scan_failures:
+                rc, lines = scan_failures[0]
+                tail = " | ".join(strip_ansi(ln).strip() for ln in lines[-2:] if ln.strip())
+                failed = (
+                    f" ({len(scan_failures)}/{len(target_handles)} handle(s) failed)"
+                    if len(target_handles) > 1
+                    else ""
+                )
+                emit(
+                    {
+                        "kind": "tool_status",
+                        "tool": name,
+                        "state": "error",
+                        "hits": len(emitted_items),
+                        "detail": f"maigret rc={rc}{failed}: {tail or 'no output'}"[:400],
+                    }
+                )
+                return
             emit({"kind": "tool_status", "tool": name, "state": "done", "hits": len(emitted_items), "detail": f"{len(emitted_items)} profile hit(s) across {len(target_handles)} handle(s)"})
 
         # -----------------------------------------------------------------
@@ -880,14 +910,16 @@ def run_sidecar(payload: dict[str, Any]) -> None:
                 }
             )
 
-            def _scan_sherlock_handle(h: str) -> list[tuple[str, str, str]]:
+            def _scan_sherlock_handle(
+                h: str,
+            ) -> tuple[list[tuple[str, str, str]], int, list[str]]:
                 argv = ["sherlock", h, "--local", "--timeout", "6", "--print-found", "--no-color"]
                 if active_proxy:
                     argv.extend(["--proxy", active_proxy])
                 for s in sites_slice:
                     argv.extend(["--site", s])
                 code = f"import sys; sys.argv = {json.dumps(argv)}; from sherlock_project.sherlock import main; main()"
-                _, lines = stream_python_code(code, build_clean_env(None), timeout=sherlock_timeout)
+                rc, lines = stream_python_code(code, build_clean_env(None), timeout=sherlock_timeout)
                 out_hits: list[tuple[str, str, str]] = []
                 for raw in lines:
                     ln = strip_ansi(raw).strip()
@@ -897,15 +929,23 @@ def run_sidecar(payload: dict[str, Any]) -> None:
                         u = m.group(2).strip()
                         if not is_blocked_spa_url(u) and not is_feed_or_asset_url(u):
                             out_hits.append((h, site, u))
-                return out_hits
+                return (out_hits, rc, lines)
 
-            if len(target_handles) == 1:
-                raw_hits = _scan_sherlock_handle(target_handles[0])
-            else:
-                raw_hits = []
+            scan_batches = (
+                [_scan_sherlock_handle(target_handles[0])]
+                if len(target_handles) == 1
+                else []
+            )
+            if len(target_handles) > 1:
                 with ThreadPoolExecutor(max_workers=len(target_handles)) as hpool:
-                    for batch in hpool.map(_scan_sherlock_handle, target_handles):
-                        raw_hits.extend(batch)
+                    scan_batches = list(hpool.map(_scan_sherlock_handle, target_handles))
+
+            raw_hits: list[tuple[str, str, str]] = []
+            scan_failures: list[tuple[int, list[str]]] = []
+            for batch_hits, rc, lines in scan_batches:
+                raw_hits.extend(batch_hits)
+                if rc != 0:
+                    scan_failures.append((rc, lines))
 
             hits: list[tuple[str, str, str]] = []
             seen_u: set[str] = set()
@@ -935,6 +975,26 @@ def run_sidecar(payload: dict[str, Any]) -> None:
                         "summary": f"Sherlock confirmed active {site} account for @{h} at {u}.",
                     }
                 )
+            # Same contract as maigret: keep parsed hits, but never report a
+            # failed subprocess as a clean 0-hit run.
+            if scan_failures:
+                rc, lines = scan_failures[0]
+                tail = " | ".join(strip_ansi(ln).strip() for ln in lines[-2:] if ln.strip())
+                failed = (
+                    f" ({len(scan_failures)}/{len(target_handles)} handle(s) failed)"
+                    if len(target_handles) > 1
+                    else ""
+                )
+                emit(
+                    {
+                        "kind": "tool_status",
+                        "tool": name,
+                        "state": "error",
+                        "hits": len(hits[:cap]),
+                        "detail": f"sherlock rc={rc}{failed}: {tail or 'no output'}"[:400],
+                    }
+                )
+                return
             emit({"kind": "tool_status", "tool": name, "state": "done", "hits": len(hits[:cap]), "detail": f"{len(hits[:cap])} profile hit(s) across {len(target_handles)} handle(s)"})
 
         # -----------------------------------------------------------------
@@ -1153,7 +1213,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="TAUF Local Open-Source Sidecar Bridge V3")
     parser.add_argument("--probe", action="store_true", help="Output JSON inventory of local OSS tools")
     parser.add_argument("--run", action="store_true", help="Run available local OSS tools and stream JSONL")
-    parser.add_argument("--payload", type=str, default="{}", help="JSON payload for --run")
+    parser.add_argument("--payload", type=str, default=None, help="JSON payload for --run (or send it on stdin)")
     args = parser.parse_args()
 
     if args.probe:
@@ -1162,8 +1222,16 @@ def main() -> int:
         return 0
 
     if args.run:
+        # SC-7: prefer an explicit --payload, otherwise read the JSON document
+        # from stdin (Node writes the payload there and closes the pipe).
+        raw = args.payload or ""
+        if not raw.strip() and not sys.stdin.isatty():
+            try:
+                raw = sys.stdin.read()
+            except Exception:
+                raw = ""
         try:
-            payload = json.loads(args.payload)
+            payload = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:
             payload = {}
         if not isinstance(payload, dict):
