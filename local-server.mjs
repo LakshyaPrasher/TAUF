@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SERVER_BUILD_ID = "v5.4-audit-hardened";
+const SERVER_BUILD_ID = "v5.5-exposure-parity";
 
 const DIST_DIR = path.join(__dirname, "dist");
 const WMN_PATH = path.join(__dirname, "src-tauri", "resources", "wmn_curated.json");
@@ -1331,6 +1331,14 @@ const PLATFORM_SLUG_ALIASES = {
   "speaker deck": "speakerdeck",
   "speakerdeck.com": "speakerdeck",
   "github gist": "gist",
+  npm: "npm",
+  "npmjs.com": "npm",
+  pypi: "pypi",
+  "pypi.org": "pypi",
+  orcid: "orcid",
+  "orcid.org": "orcid",
+  tiktok: "tiktok",
+  "tiktok.com": "tiktok",
 };
 
 function normalizePlatformSlug(platform) {
@@ -1522,6 +1530,13 @@ function extractPlatformAndHandleFromSidecar(ev) {
 function buildCanonicalProfileUrl(platform, handle) {
   const clean = String(handle || "").replace(/^@+/, "").trim();
   if (!clean) return null;
+  const rawPlat = String(platform || "").trim();
+  if (/^mastodon:/i.test(rawPlat)) {
+    const inst = rawPlat.slice("mastodon:".length).trim().toLowerCase();
+    if (inst && /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(inst)) {
+      return `https://${inst}/@${clean}`;
+    }
+  }
   const slug = normalizePlatformSlug(platform);
   switch (slug) {
     case "instagram": return `https://www.instagram.com/${clean}/`;
@@ -1532,12 +1547,20 @@ function buildCanonicalProfileUrl(platform, handle) {
     case "threads": return `https://www.threads.net/@${clean}`;
     case "facebook": return `https://www.facebook.com/${clean}`;
     case "github": return `https://github.com/${clean}`;
+    case "gist": return `https://gist.github.com/${clean}`;
     case "gitlab": return `https://gitlab.com/${clean}`;
     case "keybase": return `https://keybase.io/${clean}`;
     case "telegram": return `https://t.me/${clean}`;
     case "medium": return `https://medium.com/@${clean}`;
     case "reddit": return `https://www.reddit.com/user/${clean}`;
     case "devto": return `https://dev.to/${clean}`;
+    case "stackoverflow": return `https://stackoverflow.com/users/${clean}`;
+    case "hackernews": return `https://news.ycombinator.com/user?id=${encodeURIComponent(clean)}`;
+    case "huggingface": return `https://huggingface.co/${clean}`;
+    case "npm": return `https://www.npmjs.com/~${clean}`;
+    case "pypi": return `https://pypi.org/user/${clean}/`;
+    case "dockerhub": return `https://hub.docker.com/u/${clean}`;
+    case "orcid": return `https://orcid.org/${clean}`;
     case "kaggle": return `https://www.kaggle.com/${clean}`;
     case "behance": return `https://www.behance.net/${clean}`;
     case "dribbble": return `https://dribbble.com/${clean}`;
@@ -2086,10 +2109,30 @@ async function inspectDomainDns(domain, netCtx) {
   }
   try {
     const txt = await dns.resolveTxt(domain);
+    const verifications = [];
     for (const chunks of txt) {
-      const joined = chunks.join("");
-      if (joined.toLowerCase().startsWith("v=spf1")) {
+      const joined = chunks.join("").trim();
+      const low = joined.toLowerCase();
+      if (low.startsWith("v=spf1") && !report.spf_record) {
         report.spf_record = joined;
+      } else if (
+        /^(keybase-site-verification|github-verification|google-site-verification|protonmail-verification|atproto-did|openai-domain-verification|_github-challenge)/i.test(
+          joined
+        )
+      ) {
+        verifications.push(joined.slice(0, 140));
+      }
+    }
+    if (verifications.length > 0) report.verification_tokens = verifications.slice(0, 6);
+  } catch {
+    // ignore
+  }
+  try {
+    const atprotoTxt = await dns.resolveTxt(`_atproto.${domain}`);
+    for (const chunks of atprotoTxt) {
+      const joined = chunks.join("").trim();
+      if (/^did=/i.test(joined)) {
+        report.verification_tokens = [...(report.verification_tokens || []), `_atproto:${joined.slice(0, 120)}`].slice(0, 6);
         break;
       }
     }
@@ -3040,6 +3083,14 @@ async function extractProfileHtml(url, netCtx) {
       }
     }
 
+    // 1b. <head> <link rel="me" href="..."> (IndieWeb / Mastodon cryptographic self-links)
+    for (const m of rawHtml.matchAll(/<link\b[^>]+rel=["'][^"']*\bme\b[^"']*["'][^>]+href=["'](https?:\/\/[^"'\s<>]+)["']/gi)) {
+      same_as_urls.add(m[1]);
+    }
+    for (const m of rawHtml.matchAll(/<link\b[^>]+href=["'](https?:\/\/[^"'\s<>]+)["'][^>]+rel=["'][^"']*\bme\b[^"']*["']/gi)) {
+      same_as_urls.add(m[1]);
+    }
+
     // 2. Strip <footer>, <nav>, <aside>, non-JSON-LD <script>, <style> BEFORE scanning!
     const html = stripBoilerplateHtml(rawHtml);
 
@@ -3554,7 +3605,7 @@ function probeSidecarTools() {
   return result;
 }
 
-function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, netCtx, depthLevel, onEvent) {
+function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, netCtx, depthLevel, onEvent, domains = []) {
   return new Promise((resolve) => {
     const py = detectPythonPath();
     if (!py || !fs.existsSync(SIDECAR_BRIDGE)) return resolve();
@@ -3567,6 +3618,7 @@ function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, net
       phone: phones[0] || input.phone,
       phones,
       domain: input.domain,
+      domains: Array.isArray(domains) ? domains : [],
       passive_only: input.passive_only,
       enable_tor: input.enable_tor,
       strict_anonymity: Boolean(netCtx?.strictAnonymity),
@@ -4120,7 +4172,7 @@ function extractSocialAccountFromUrl(rawHref, title, fullName) {
     const u = new URL(rawHref);
     u.hash = "";
     cleanUrl = u.toString();
-    if (/\.(atom|rss|xml|json|keys|gpg|asc|png|jpg|jpeg|svg|css|js|ico|txt|pdf)$/i.test(u.pathname)) {
+    if (/\.(atom|rss|xml|json|keys|gpg|asc|png|jpg|jpeg|svg|css|js|ico|txt|pdf|php|asp|aspx)$/i.test(u.pathname)) {
       return null;
     }
   } catch {
@@ -4202,6 +4254,74 @@ function extractSocialAccountFromUrl(rawHref, title, fullName) {
     const h = m[1].toLowerCase();
     if (!drbReserved.has(h)) return { platform: "Dribbble", handle: h, url: `https://dribbble.com/${m[1]}` };
   }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?gitlab\.com\/([A-Za-z0-9_.\-]{2,40})(?:\/?(?:\?.*)?)?$/i))) {
+    const h = m[1].toLowerCase();
+    if (!RESERVED_PATHS.has(h) && !assetExtRe.test(h)) return { platform: "GitLab", handle: h, url: `https://gitlab.com/${m[1]}` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/gist\.github\.com\/([A-Za-z0-9][A-Za-z0-9\-]{1,38})(?:\/?(?:\?.*)?)?$/i))) {
+    const h = m[1].toLowerCase();
+    if (!RESERVED_PATHS.has(h) && !["discover", "forked", "starred"].includes(h)) {
+      return { platform: "Gist", handle: h, url: `https://gist.github.com/${m[1]}` };
+    }
+  }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?dev\.to\/([A-Za-z0-9_]{2,40})(?:\/?(?:\?.*)?)?$/i))) {
+    const h = m[1].toLowerCase();
+    if (!RESERVED_PATHS.has(h) && !["t", "top", "latest", "pod", "videos", "tags", "readinglist"].includes(h)) {
+      return { platform: "Dev.to", handle: h, url: `https://dev.to/${m[1]}` };
+    }
+  }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?stackoverflow\.com\/users\/(\d{2,12}(?:\/[A-Za-z0-9_\-.]+)?)(?:[/?#]|$)/i))) {
+    const h = m[1].replace(/\/+$/, "").toLowerCase();
+    return { platform: "StackOverflow", handle: h, url: `https://stackoverflow.com/users/${h}` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/news\.ycombinator\.com\/user\?id=([A-Za-z0-9_\-]{2,30})(?:&|$)/i))) {
+    const h = m[1].toLowerCase();
+    return { platform: "HackerNews", handle: h, url: `https://news.ycombinator.com/user?id=${m[1]}` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?huggingface\.co\/([A-Za-z0-9_\-.]{2,40})(?:\/?(?:\?.*)?)?$/i))) {
+    const h = m[1].toLowerCase();
+    if (!RESERVED_PATHS.has(h) && !["models", "datasets", "spaces", "docs", " tasks", "tasks", "papers", "posts", "pricing", "join"].includes(h) && !assetExtRe.test(h)) {
+      return { platform: "HuggingFace", handle: h, url: `https://huggingface.co/${m[1]}` };
+    }
+  }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?npmjs\.com\/~([A-Za-z0-9_\-.]{2,40})(?:[/?#]|$)/i))) {
+    const h = m[1].toLowerCase();
+    return { platform: "npm", handle: h, url: `https://www.npmjs.com/~${m[1]}` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?pypi\.org\/user\/([A-Za-z0-9_\-.]{2,40})(?:[/?#]|$)/i))) {
+    const h = m[1].toLowerCase();
+    return { platform: "PyPI", handle: h, url: `https://pypi.org/user/${m[1]}/` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/hub\.docker\.com\/u\/([A-Za-z0-9_\-]{2,40})(?:[/?#]|$)/i))) {
+    const h = m[1].toLowerCase();
+    return { platform: "DockerHub", handle: h, url: `https://hub.docker.com/u/${m[1]}` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?orcid\.org\/(\d{4}-\d{4}-\d{4}-\d{3}[\dX])(?:[/?#]|$)/i))) {
+    const h = m[1].toUpperCase();
+    return { platform: "ORCID", handle: h, url: `https://orcid.org/${h}` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/t\.me\/([A-Za-z0-9_]{4,32})(?:\/?(?:\?.*)?)?$/i))) {
+    const h = m[1].toLowerCase();
+    if (!RESERVED_PATHS.has(h) && !["s", "joinchat", "addstickers", "share", "iv", "proxy", "socks"].includes(h)) {
+      return { platform: "Telegram", handle: h, url: `https://t.me/${m[1]}` };
+    }
+  }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?keybase\.io\/([A-Za-z0-9_]{2,24})(?:\/?(?:\?.*)?)?$/i))) {
+    const h = m[1].toLowerCase();
+    if (!RESERVED_PATHS.has(h)) return { platform: "Keybase", handle: h, url: `https://keybase.io/${m[1]}` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/(?:www\.)?tiktok\.com\/@([A-Za-z0-9_.]{2,30})(?:[/?#]|$)/i))) {
+    const h = m[1].toLowerCase();
+    if (!RESERVED_PATHS.has(h) && !assetExtRe.test(h)) return { platform: "TikTok", handle: h, url: `https://www.tiktok.com/@${m[1]}` };
+  }
+  if ((m = cleanUrl.match(/https?:\/\/([a-z0-9.-]+\.(?:social|online|world|tech|fosstodon\.org|infosec\.exchange|hachyderm\.io|mas\.to|mstdn\.social))\/@([A-Za-z0-9_]{2,32})(?:\/?(?:\?.*)?)?$/i)) ||
+      (m = cleanUrl.match(/https?:\/\/(fosstodon\.org|infosec\.exchange|hachyderm\.io|mas\.to|mstdn\.social)\/@([A-Za-z0-9_]{2,32})(?:\/?(?:\?.*)?)?$/i))) {
+    const host = m[1].toLowerCase();
+    const h = m[2].toLowerCase();
+    if (!["youtube.com", "threads.net", "threads.com", "tiktok.com", "medium.com"].some((d) => host === d || host.endsWith(`.${d}`))) {
+      return { platform: `Mastodon:${host}`, handle: h, url: `https://${host}/@${m[2]}` };
+    }
+  }
   return null;
 }
 
@@ -4212,7 +4332,7 @@ function extractSocialAccountFromUrl(rawHref, title, fullName) {
  * - Direct clean public HTML profile verification for top handle permutations
  * - Respectful multi-engine direct-HTML public search cascade (Startpage, DDG Lite, DDG HTML, Brave, Mojeek)
  */
-async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHandles = []) {
+async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHandles = [], contextTerms = []) {
   const out = {
     accounts: [], // [{ platform, handle, url, title, bio, confidence, match_tier, match_reason }]
     records: [], // [{ title, url, source, snippet, category, pdfs?, websites? }]
@@ -4327,7 +4447,10 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
     const rw = await sovereignFetch(wikiUrl, { maxBytes: 250_000, jitter: false }, netCtx, 9000);
     if (rw.ok) {
       const html = await rw.text();
-      if (!html.includes("Wikipedia does not have an article with this exact name")) {
+      const isDisambig =
+        html.includes("Wikipedia does not have an article with this exact name") ||
+        /id=["']disambigbox["']|\/wiki\/Help:Disambiguation|wgCategories[^\n]*Disambiguation|\bmay refer to:/i.test(html);
+      if (!isDisambig) {
         const pM = html.match(/<p[^>]*>([\s\S]{40,600}?)<\/p>/i);
         const snippet = pM ? decodeHtmlEntities(pM[1].replace(/<[^>]+>/g, " ")).slice(0, 220) : `Wikipedia biography for ${fullName}`;
         out.records.push({
@@ -4624,16 +4747,32 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
     return matchedCount;
   };
 
-  // Startpage-friendly query cascade (up to 10 results/query across engines)
-  await runDorkCascade("social", `"${fullName}" instagram`);
-  await runDorkCascade("social", `"${fullName}" linkedin`);
-  await runDorkCascade("general", `"${fullName}"`);
-  await runDorkCascade("pdf", `"${fullName}" filetype:pdf`);
+  // Batched concurrency-2 Startpage-friendly query cascade (halves wall-clock while broadening surface)
+  const dorkSpecs = [
+    ["social", `"${fullName}" instagram`],
+    ["social", `"${fullName}" linkedin`],
+    ["general", `"${fullName}"`],
+    ["pdf", `"${fullName}" filetype:pdf`],
+  ];
   if (depthLevel >= 2) {
-    await runDorkCascade("legal_corp", `"${fullName}" ("director" OR "founder" OR "CEO" OR "patent" OR "court")`);
+    dorkSpecs.push([
+      "social",
+      `"${fullName}" (site:dev.to OR site:medium.com OR site:huggingface.co OR site:stackoverflow.com/users OR site:pypi.org OR site:npmjs.com OR site:orcid.org)`,
+    ]);
+    dorkSpecs.push(["legal_corp", `"${fullName}" ("director" OR "founder" OR "CEO" OR "patent" OR "court")`]);
+    const cleanCtx = (Array.isArray(contextTerms) ? contextTerms : [])
+      .map((t) => String(t || "").trim())
+      .filter((t) => t.length >= 3);
+    if (cleanCtx.length > 0) {
+      dorkSpecs.push(["general", `"${fullName}" "${cleanCtx[0]}"`]);
+    }
   }
   if (depthLevel >= 3) {
-    await runDorkCascade("contact", `"${fullName}" ("@gmail.com" OR "@proton.me" OR "email" OR "contact")`);
+    dorkSpecs.push(["contact", `"${fullName}" ("@gmail.com" OR "@proton.me" OR "email" OR "contact")`]);
+  }
+  for (let i = 0; i < dorkSpecs.length; i += 2) {
+    const pair = dorkSpecs.slice(i, i + 2);
+    await Promise.all(pair.map(([k, q]) => runDorkCascade(k, q)));
   }
 
   return out;
@@ -4658,6 +4797,38 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
   };
 
   await Promise.all([
+    // 0. ORCID Academic / Researcher Registry Direct HTML (zero REST API!)
+    (async () => {
+      try {
+        const orcidUrl = `https://orcid.org/orcid-search/search?searchQuery=${encodeURIComponent(fullName)}`;
+        const r = await sovereignFetch(orcidUrl, { maxBytes: 240_000, jitter: false, socksUser: nextPrSocksUser() }, netCtx, 10000);
+        if (!r.ok) return;
+        const html = await r.text();
+        let count = 0;
+        for (const m of html.matchAll(/(\d{4}-\d{4}-\d{4}-\d{3}[\dX])/g)) {
+          const oid = m[1].toUpperCase();
+          const idx = m.index || 0;
+          const windowTxt = decodeHtmlEntities(html.slice(Math.max(0, idx - 320), idx + 320).replace(/<[^>]+>/g, " "));
+          if (!nameEvidence(windowTxt, fullName).strong) continue;
+          const url = `https://orcid.org/${oid}`;
+          if (seen.has(url)) continue;
+          seen.add(url);
+          records.push({
+            title: `${fullName} — ORCID Researcher (${oid})`,
+            url,
+            source: "ORCID Registry",
+            snippet: windowTxt.replace(/\s+/g, " ").trim().slice(0, 180),
+            kind: "record",
+            record_type: "Academic Publication",
+          });
+          count++;
+          if (count >= 2) break;
+        }
+      } catch {
+        // ignore
+      }
+    })(),
+
     // 1. US CourtListener Direct HTML
     (async () => {
       try {
@@ -4862,7 +5033,7 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
  * Searches Pastebin, Rentry, Dpaste, JustPaste.it, Ghostbin, ControlC, Paste.ee, and leak/breach
  * references for exact full-name or exact email matches (zero false positives).
  */
-async function discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles, netCtx, depthLevel = 2) {
+async function discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles, netCtx, depthLevel = 2, knownDomains = []) {
   const hits = [];
   const seenUrls = new Set();
   const nonce = `pl-${Math.floor(Date.now() / 1000).toString(36)}`;
@@ -4873,41 +5044,105 @@ async function discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles,
     {
       q: `"${fullName}" (site:pastebin.com OR site:rentry.co OR site:dpaste.org OR site:justpaste.it OR site:ghostbin.me OR site:controlc.com OR site:paste.ee)`,
       queryType: "full_name",
+      matchedTerm: fullName,
       parentEmail: null,
+      parentDomain: null,
       requireLeakKeyword: false,
     },
   ];
-  if (knownEmails.length > 0) {
+  for (const em of (knownEmails || []).slice(0, depthLevel >= 3 ? 3 : 2)) {
     queries.push({
-      q: `"${knownEmails[0]}" (site:pastebin.com OR site:rentry.co OR site:justpaste.it OR "leak" OR "breach" OR "combolist" OR "paste")`,
+      q: `"${em}" (site:pastebin.com OR site:rentry.co OR site:justpaste.it OR site:gist.github.com OR "leak" OR "breach" OR "combolist" OR "paste" OR ".onion")`,
       queryType: "email",
-      parentEmail: knownEmails[0],
+      matchedTerm: em,
+      parentEmail: em,
+      parentDomain: null,
       requireLeakKeyword: false,
+    });
+  }
+  const ownedDomains = (knownDomains || []).filter((d) => d && !FREE_MAIL_DOMAINS.has(d)).slice(0, 2);
+  for (const dom of ownedDomains) {
+    queries.push({
+      q: `"${dom}" (site:pastebin.com OR site:rentry.co OR ".onion" OR "breach" OR "leaked" OR "credentials" OR "backup" OR "dump")`,
+      queryType: "domain",
+      matchedTerm: dom,
+      parentEmail: null,
+      parentDomain: dom,
+      requireLeakKeyword: true,
     });
   }
   if (depthLevel >= 3) {
     queries.push({
       q: `"${fullName}" ("doxbin" OR "breach" OR "combolist" OR "leaked database" OR ".onion")`,
       queryType: "full_name",
+      matchedTerm: fullName,
       parentEmail: null,
+      parentDomain: null,
       requireLeakKeyword: true,
     });
+    for (const h of (knownHandles || []).filter((x) => x && x.length >= 6).slice(0, 2)) {
+      queries.push({
+        q: `"${h}" (site:pastebin.com OR site:rentry.co OR site:justpaste.it OR ".onion" OR "breach" OR "combolist")`,
+        queryType: "handle",
+        matchedTerm: h,
+        parentEmail: null,
+        parentDomain: null,
+        requireLeakKeyword: true,
+      });
+    }
   }
 
-  const pasteOrLeakRe = /\b(doxbin|breach|combolist|leaked|leak|paste|pastebin|rentry|dpaste|justpaste|ghostbin|controlc|paste\.ee|\.onion)\b/i;
+  const pasteOrLeakRe = /\b(doxbin|breach|combolist|leaked|leak|paste|pastebin|rentry|dpaste|justpaste|ghostbin|controlc|paste\.ee|credentials|dump|\.onion)\b/i;
+
+  const fetchSearchCascadeItems = async (queryStr) => {
+    const spRes = await queryStartpageWithRetry(queryStr, netCtx, nextSocksUser, 14000);
+    if (spRes.strictBlocked) return { strictBlocked: true, items: [] };
+    if (spRes.ok && spRes.items.length > 0) return { strictBlocked: false, items: spRes.items };
+    // Fall back across DDG-Lite and Brave when Startpage blocks or returns 0 items on boolean paste dorks
+    for (const engId of ["ddg-lite", "brave", "mojeek"]) {
+      const eng = SEARCH_ENGINES.find((e) => e.id === engId);
+      if (!eng) continue;
+      try {
+        const r = await sovereignFetch(
+          eng.buildUrl(queryStr),
+          { maxBytes: 420_000, jitter: false, socksUser: nextSocksUser() },
+          netCtx,
+          eng.timeoutMs || 9500
+        );
+        if (!r.ok) continue;
+        const html = await r.text();
+        if (detectSearchChallenge(r, html)) continue;
+        const items = parseSearchResults(eng.id, html);
+        if (items.length > 0) return { strictBlocked: false, items };
+      } catch (err) {
+        if (String(err?.message || "").includes("STRICT_ANONYMITY_BLOCKED")) {
+          return { strictBlocked: true, items: [] };
+        }
+      }
+    }
+    return { strictBlocked: false, items: spRes.items || [] };
+  };
 
   for (const spec of queries) {
-    const spRes = await queryStartpageWithRetry(spec.q, netCtx, nextSocksUser, 15000);
-    if (spRes.strictBlocked) break;
-    if (!spRes.ok) continue;
-    for (const item of spRes.items.slice(0, 8)) {
+    const cascRes = await fetchSearchCascadeItems(spec.q);
+    if (cascRes.strictBlocked) break;
+    for (const item of cascRes.items.slice(0, 8)) {
       if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
       if (seenUrls.has(item.url)) continue;
       const textCombined = `${item.title || ""} ${item.snippet || ""}`;
-      const matched =
-        spec.queryType === "email" && spec.parentEmail
-          ? textCombined.toLowerCase().includes(spec.parentEmail.toLowerCase())
-          : hasFullNameMatch(textCombined, fullName);
+      const lowText = textCombined.toLowerCase();
+      let matched = false;
+      if (spec.queryType === "email" && spec.parentEmail) {
+        matched = lowText.includes(spec.parentEmail.toLowerCase());
+      } else if (spec.queryType === "domain" && spec.parentDomain) {
+        const escD = spec.parentDomain.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        matched = new RegExp(`(?:^|[^a-z0-9.-])${escD}(?:$|[^a-z0-9.-])`, "i").test(lowText);
+      } else if (spec.queryType === "handle" && spec.matchedTerm) {
+        const escH = spec.matchedTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        matched = new RegExp(`(?:^|[^a-z0-9])${escH}(?:$|[^a-z0-9])`, "i").test(lowText);
+      } else {
+        matched = nameEvidence(textCombined, fullName).proximity || nameEvidence(textCombined, fullName).strong;
+      }
       if (!matched) continue;
       if (spec.requireLeakKeyword && !pasteOrLeakRe.test(`${item.url} ${textCombined}`)) continue;
 
@@ -4917,8 +5152,9 @@ async function discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles,
       } catch {
         host = "paste";
       }
-      // Never misclassify regular GitHub Gist user profiles as paste leaks
+      // Never misclassify regular GitHub Gist user profiles or social profiles as paste leaks
       if (host === "gist.github.com" && !/\/[a-f0-9]{16,}/i.test(item.url)) continue;
+      if (/(?:^|\.)(?:linkedin\.com|instagram\.com|facebook\.com|youtube\.com|wikipedia\.org)$/i.test(host)) continue;
 
       seenUrls.add(item.url);
       hits.push({
@@ -4926,13 +5162,37 @@ async function discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles,
         url: item.url,
         snippet: (item.snippet || "").slice(0, 240),
         host,
-        matchedTerm: spec.parentEmail || fullName,
+        matchedTerm: spec.matchedTerm || spec.parentEmail || fullName,
         queryType: spec.queryType,
         parentEmail: spec.parentEmail,
+        parentDomain: spec.parentDomain,
+        verification_state: "index_only",
       });
-      if (hits.length >= 8) break;
+      if (hits.length >= 10) break;
     }
-    if (hits.length >= 8) break;
+    if (hits.length >= 10) break;
+  }
+
+  // ACC-7: bounded single-page live verification on top paste candidates (32 KB / 7.5 s)
+  const toVerify = hits.slice(0, 4);
+  if (toVerify.length > 0) {
+    await Promise.allSettled(
+      toVerify.map(async (h) => {
+        try {
+          const r = await sovereignFetch(h.url, { maxBytes: 32768, jitter: false, socksUser: nextSocksUser() }, netCtx, 7500);
+          if (!r.ok) return;
+          const raw = await r.text();
+          const plain = decodeHtmlEntities(stripBoilerplateHtml(raw).replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+          if (plain && plain.toLowerCase().includes(String(h.matchedTerm || "").toLowerCase())) {
+            h.verification_state = "live_verified";
+            const ex = extractContextExcerpt(plain, h.matchedTerm);
+            if (ex) h.snippet = ex.slice(0, 260);
+          }
+        } catch {
+          // keep index_only
+        }
+      })
+    );
   }
 
   return hits;
@@ -5475,8 +5735,20 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
     } else {
       return null;
     }
+  } else if (qType === "domain") {
+    // Owned clearnet domain (e.g. mitchellh.com): v3 .onion hostnames are 56-char base32 hashes
+    // and never equal the clearnet domain, so an exact boundary match in snippet/body/title is valid.
+    if (cleanQuery.length < 4 || !cleanQuery.includes(".")) return null;
+    const escD = cleanQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const exactDom = new RegExp(`(?:^|[^a-z0-9.-])${escD}(?:$|[^a-z0-9.-])`, "i");
+    if (!exactDom.test(lowCombined)) return null;
+    const strongName = Boolean(fullName) && nameEvidence(combinedCorpus, fullName).strong;
+    match_precision = strongName && isLive ? "exact" : "handle";
+    match_tier = strongName && isLive ? "verified" : "probable";
+    confidence = strongName && isLive ? 0.87 : isLive ? 0.80 : 0.74;
+    matched_identifier = `Domain: ${cleanQuery}`;
   } else {
-    // handle or domain: exact token boundary in the body AND in an identity field
+    // handle: exact token boundary in the body AND in an identity field
     // (title / URL host+path), unless strong name evidence independently supports the page.
     if (cleanQuery.length < 5) return null;
     const escQ = cleanQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -5492,7 +5764,7 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
     match_precision = "handle";
     match_tier = "probable";
     confidence = isLive ? 0.78 : 0.72;
-    matched_identifier = qType === "domain" ? `Domain: ${cleanQuery}` : `Handle: @${cleanQuery}`;
+    matched_identifier = `Handle: @${cleanQuery}`;
   }
 
   const { site_category, site_purpose } = classifyOnionSitePurpose(
@@ -6078,10 +6350,14 @@ async function runInvestigation(caseId, input, auth) {
   const webDiscoveredSites = [];
   const verifiedHandlesPriority = [];
 
+  const stage0aContextTerms = [
+    input.org?.trim(),
+    ...knownDomains.filter((d) => d && !FREE_MAIL_DOMAINS.has(d)),
+  ].filter(Boolean);
   let stage0aTruncated = false;
   const [socialWebRes, pubRecordsRes] = await withDeadline(
     Promise.all([
-      discoverSocialAndWeb(fullName, netCtx, depthLevel, knownHandles),
+      discoverSocialAndWeb(fullName, netCtx, depthLevel, knownHandles, stage0aContextTerms),
       depthLevel >= 2
         ? discoverPublicRecords(fullName, netCtx, depthLevel)
         : Promise.resolve({ records: [], pdfLinks: [] }),
@@ -7567,15 +7843,24 @@ async function runInvestigation(caseId, input, auth) {
       });
     }
 
-    for (let i = 0; i < accountArtifacts.length; i++) {
-      for (let j = i + 1; j < accountArtifacts.length; j++) {
-        const a = accountArtifacts[i];
-        const b = accountArtifacts[j];
+    // OPT-02: hoist URL normalization out of the pairwise O(n^2) loop (24-40x speedup).
+    const preNormArtifacts = accountArtifacts.map((art) => ({
+      art,
+      normUrl: normUrlForMatch(art.url),
+      normOutbound: (art.outboundUrls || []).map((u) => normUrlForMatch(u)).filter(Boolean),
+    }));
+    for (let i = 0; i < preNormArtifacts.length; i++) {
+      for (let j = i + 1; j < preNormArtifacts.length; j++) {
+        const aEntry = preNormArtifacts[i];
+        const bEntry = preNormArtifacts[j];
+        const a = aEntry.art;
+        const b = bEntry.art;
         if (a.nodeId === b.nodeId) continue;
-        const aNorm = normUrlForMatch(a.url);
-        const bNorm = normUrlForMatch(b.url);
-        const aLinksB = (a.outboundUrls || []).some((u) => normUrlForMatch(u).includes(bNorm) || bNorm.includes(normUrlForMatch(u)));
-        const bLinksA = (b.outboundUrls || []).some((u) => normUrlForMatch(u).includes(aNorm) || aNorm.includes(normUrlForMatch(u)));
+        const aNorm = aEntry.normUrl;
+        const bNorm = bEntry.normUrl;
+        if (!aNorm || !bNorm) continue;
+        const aLinksB = aEntry.normOutbound.some((u) => u.includes(bNorm) || bNorm.includes(u));
+        const bLinksA = bEntry.normOutbound.some((u) => u.includes(aNorm) || aNorm.includes(u));
         if (aLinksB && bLinksA) {
           addEdge(a.nodeId, b.nodeId, "reciprocal_proof", 0.97, "reciprocal-proof");
           for (const g of [a, b]) {
@@ -7636,17 +7921,48 @@ async function runInvestigation(caseId, input, auth) {
         if (sa.toLowerCase().includes(".pdf")) {
           if (!discoveredPdfUrls.includes(sa)) discoveredPdfUrls.push(sa);
           pdfParentMap.set(sa, { parentId, relation: "linked_pdf" });
-        } else {
-          if (!personalWebsites.includes(sa)) personalWebsites.push(sa);
-          pageParentMap.set(sa, parentId);
-          try {
-            const dom = new URL(sa).hostname.replace(/^www\./, "").toLowerCase();
-            if (dom && !PLATFORM_NOISE_DOMAINS.some((d) => dom === d || dom.endsWith(`.${d}`))) {
-              domainParentMap.set(dom, { parentId, relation: "links_to" });
-            }
-          } catch {
-            // ignore
+          continue;
+        }
+        const saAcc = extractSocialAccountFromUrl(sa, fullName, fullName);
+        if (saAcc && !isBlockedSpaUrl(saAcc.url)) {
+          const saAcctId = normalizeAccountNodeId(saAcc.platform, saAcc.handle);
+          addNode({
+            id: saAcctId,
+            kind: "account",
+            label: `${saAcc.platform} (@${saAcc.handle})`,
+            sublabel: "Self-Linked Profile (sameAs / rel=me)",
+            layer: "anchor",
+            confidence: 0.88,
+            status: "unverified",
+            sources: ["html-extractor"],
+            metadata: {
+              platform: saAcc.platform,
+              handle: saAcc.handle,
+              match_tier: "verified",
+              match_reason: "JSON-LD sameAs / rel=me self-link from confirmed profile",
+            },
+            url: saAcc.url,
+            depth: parentDepth + 1,
+          });
+          if (parentId !== saAcctId) {
+            addEdge(parentId, saAcctId, "same_as", 0.88, "html-extractor");
           }
+          const hl = saAcc.handle.toLowerCase();
+          if (hl.length >= 3 && !hl.includes("/") && !knownHandles.includes(hl)) {
+            knownHandles.push(hl);
+          }
+          extHits++;
+          continue;
+        }
+        if (!personalWebsites.includes(sa)) personalWebsites.push(sa);
+        pageParentMap.set(sa, parentId);
+        try {
+          const dom = new URL(sa).hostname.replace(/^www\./, "").toLowerCase();
+          if (dom && !PLATFORM_NOISE_DOMAINS.some((d) => dom === d || dom.endsWith(`.${d}`))) {
+            domainParentMap.set(dom, { parentId, relation: "links_to" });
+          }
+        } catch {
+          // ignore
         }
       }
       for (const em of data.emails) {
@@ -8010,15 +8326,17 @@ async function runInvestigation(caseId, input, auth) {
       return "duplicate";
     }
 
-    // False-positive gate: index-level verdict is authoritative for admission. Callers may
-    // supply a precomputed preCheck; otherwise derive it here from index data only.
-    const indexVerdict =
-      preCheck === undefined
-        ? classifyOnionHit(rawHit, query, queryType, fullName, null)
-        : preCheck;
-    if (indexVerdict === null) return "filtered";
+    // False-positive gate: if livePageData was fetched from the landing page, evaluate
+    // directly against the live page; otherwise require an index-level verdict.
+    if (!livePageData?.reachable) {
+      const indexVerdict =
+        preCheck === undefined
+          ? classifyOnionHit(rawHit, query, queryType, fullName, null)
+          : preCheck;
+      if (indexVerdict === null) return "filtered";
+    }
 
-    // Live probing happens upstream (Stage 3A); here we only classify with supplied data.
+    // Classify with livePageData when available (or index-only otherwise).
     const classified = classifyOnionHit(rawHit, query, queryType, fullName, livePageData);
     if (!classified || classified.match_tier === "collision") return "filtered";
 
@@ -8077,17 +8395,25 @@ async function runInvestigation(caseId, input, auth) {
   };
 
   // -------------------------------------------------------------------------
-  // Wave 3: Exposure Audit & Corroboration (Tor search, corpus, sidecars)
+  // Wave 3: Parallel Exposure Audit & Sidecar Suite (Tor search, corpus, sidecars)
   // -------------------------------------------------------------------------
   tracker.setWave(2);
+  const corpusDir = auth.local_corpus_dir?.trim() || DEFAULT_CORPUS_DIR;
+  let sidecarOnionProbes = 0;
 
+  emitStage(
+    "wave3_exposure",
+    `Auditing Tor .onion indexes, paste/leak cascades, local corpus & 7 sidecar tools in parallel (L${depthLevel})`,
+    76
+  );
+
+  const runTorDarkwebWave = async () => {
   if (input.enable_tor) {
-    emitStage("tor_darkweb", "Searching live Tor .onion indexes (Ahmia v3 + OnionLand v3) & paste/leak indexes", 82);
-    emitTool("tor-socks5h", "running", 0, "Querying Ahmia v3, OnionLand v3 & paste/leak indexes over socks5h://");
+    emitTool("tor-socks5h", "running", 0, "Querying Ahmia v3, OnionLand v3 & paste/leak cascade over socks5h://");
     if (!tor.available) {
       emitTool("tor-socks5h", "skipped", 0, "Tor offline (127.0.0.1:9050)");
     } else {
-      const termLimit = { 1: 1, 2: 2, 3: 4, 4: 6 }[depthLevel] || 2;
+      const termLimit = { 1: 1, 2: 3, 3: 5, 4: 6 }[depthLevel] || 3;
       const structuredQueries = [];
       const seenQ = new Set();
       const pushQ = (query, queryType, parentNodeId) => {
@@ -8099,11 +8425,11 @@ async function runInvestigation(caseId, input, auth) {
       };
       pushQ(fullName, "full_name", seedId);
       for (const em of knownEmails.slice(0, 2)) pushQ(em, "email", normalizeNodeId("email", em));
+      for (const d of knownDomains.filter((x) => !FREE_MAIL_DOMAINS.has(x)).slice(0, 2)) {
+        pushQ(d, "domain", normalizeNodeId("domain", d));
+      }
       for (const h of knownHandles.filter((x) => x.length >= 5).slice(0, 2)) {
         pushQ(h, "handle", findHandleHubOrAccount(h) || seedId);
-      }
-      for (const d of knownDomains.filter((x) => !FREE_MAIL_DOMAINS.has(x)).slice(0, 1)) {
-        pushQ(d, "domain", normalizeNodeId("domain", d));
       }
 
       const queriesToRun = structuredQueries.slice(0, termLimit);
@@ -8113,7 +8439,7 @@ async function runInvestigation(caseId, input, auth) {
       // Run public paste/leak index search over Tor in parallel with live .onion index queries
       const pastePromise =
         depthLevel >= 2
-          ? discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles, netCtx, depthLevel).catch(() => [])
+          ? discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles, netCtx, depthLevel, knownDomains).catch(() => [])
           : Promise.resolve([]);
 
       for (const qObj of queriesToRun) {
@@ -8165,8 +8491,10 @@ async function runInvestigation(caseId, input, auth) {
         if (stronger) candidateByUrl.set(canonUrl, entry);
       }
 
-      // Drop index-level false positives BEFORE any probe budget is spent.
-      const rankedCandidates = Array.from(candidateByUrl.values())
+      // Drop index-level false positives BEFORE spending primary probe budget, while saving up
+      // to 2 fallback probe slots for snippet-less index hits.
+      const allDeduped = Array.from(candidateByUrl.values());
+      const rankedCandidates = allDeduped
         .filter((cand) => cand.preCheck !== null)
         .sort(
           (a, b) =>
@@ -8175,6 +8503,10 @@ async function runInvestigation(caseId, input, auth) {
             String(a.hit.engine || "").localeCompare(String(b.hit.engine || "")) ||
             a.canonUrl.localeCompare(b.canonUrl)
         );
+      const snippetlessFallbacks = allDeduped
+        .filter((cand) => cand.preCheck === null && !String(cand.hit.snippet || "").trim())
+        .sort((a, b) => b.queryScore - a.queryScore)
+        .slice(0, 2);
 
       const maxOnionHits = depthLevel >= 3 ? 16 : 10;
       const PROBE_LIMIT = 5;
@@ -8184,7 +8516,7 @@ async function runInvestigation(caseId, input, auth) {
       // ONION-2: reserve up to 5 top-ranked candidates atomically (seenOnions.add BEFORE
       // awaiting) so concurrent sidecar events can never double-probe the same .onion.
       const probeQueue = [];
-      for (const cand of rankedCandidates.slice(0, maxOnionHits)) {
+      for (const cand of [...rankedCandidates.slice(0, maxOnionHits), ...snippetlessFallbacks]) {
         if (probeQueue.length >= PROBE_LIMIT) break;
         if (seenOnions.has(cand.canonUrl)) continue;
         seenOnions.add(cand.canonUrl);
@@ -8220,7 +8552,7 @@ async function runInvestigation(caseId, input, auth) {
       let torHits = 0;
       let spamRejected = 0;
       const seenSpamUrls = new Set();
-      for (const cand of rankedCandidates) {
+      for (const cand of [...rankedCandidates, ...snippetlessFallbacks.filter((c) => probeResults.has(c.canonUrl))]) {
         if (torHits >= maxOnionHits) break;
         const livePageData = probeResults.get(cand.canonUrl) || null;
         const outcome = await admitClassifiedOnion(
@@ -8247,21 +8579,42 @@ async function runInvestigation(caseId, input, auth) {
       for (const p of pasteMentions) {
         const pasteId = normalizeNodeId("paste", p.url);
         const emParentId = p.parentEmail ? normalizeNodeId("email", p.parentEmail) : null;
+        const domParentId = p.parentDomain ? normalizeNodeId("domain", p.parentDomain) : null;
+        const hParentId = p.queryType === "handle" ? findHandleHubOrAccount(p.matchedTerm) : null;
         const parentId =
-          emParentId && snap.nodes.some((n) => n.id === emParentId) ? emParentId : seedId;
+          (emParentId && snap.nodes.some((n) => n.id === emParentId) && emParentId) ||
+          (domParentId && snap.nodes.some((n) => n.id === domParentId) && domParentId) ||
+          (hParentId && snap.nodes.some((n) => n.id === hParentId) && hParentId) ||
+          seedId;
         const pDepth = findNodeDepth(parentId) + 1;
-        // G1: an exact email is strong; for name queries require a strong phrase for verified.
+        const isLiveVerified = p.verification_state === "live_verified";
         const pasteNameEv =
-          p.queryType === "email"
-            ? null
-            : nameEvidence(`${p.title || ""} ${p.snippet || ""}`, fullName);
+          p.queryType === "full_name"
+            ? nameEvidence(`${p.title || ""} ${p.snippet || ""}`, fullName)
+            : null;
+        const isStrongMatch =
+          p.queryType === "email" ||
+          (p.queryType === "domain" && isLiveVerified) ||
+          (p.queryType === "full_name" && Boolean(pasteNameEv?.strong) && isLiveVerified);
         const conf =
-          p.queryType === "email" ? 0.88 : pasteNameEv?.strong ? 0.8 : 0.66;
+          p.queryType === "email"
+            ? isLiveVerified ? 0.91 : 0.86
+            : isStrongMatch
+            ? 0.84
+            : 0.72;
+        const matchedIdent =
+          p.queryType === "email"
+            ? `Email: ${p.matchedTerm}`
+            : p.queryType === "domain"
+            ? `Domain: ${p.matchedTerm}`
+            : p.queryType === "handle"
+            ? `Handle: @${p.matchedTerm}`
+            : `Full Name: ${p.matchedTerm}`;
         addNode({
           id: pasteId,
           kind: "paste",
           label: p.title.slice(0, 64),
-          sublabel: `${p.host} · Paste / Leak Mention`,
+          sublabel: `${p.host} · ${isLiveVerified ? "Live Verified Paste" : "Paste / Leak Mention"}`,
           layer: "darkweb",
           confidence: conf,
           status: "unverified",
@@ -8269,16 +8622,11 @@ async function runInvestigation(caseId, input, auth) {
           metadata: {
             source: p.host,
             matched_term: p.matchedTerm,
-            matched_identifier: p.queryType === "email" ? `Email: ${p.matchedTerm}` : `Full Name: ${p.matchedTerm}`,
+            matched_identifier: matchedIdent,
+            verification_state: p.verification_state || "index_only",
             bio: p.snippet,
-            match_tier:
-              p.queryType === "email" ? "verified" : pasteNameEv?.strong ? "verified" : "probable",
-            match_reason:
-              p.queryType === "email"
-                ? `Public paste/leak exact email on ${p.host}`
-                : pasteNameEv?.strong
-                ? `Public paste/leak strong name phrase on ${p.host}`
-                : `Public paste/leak name proximity/weak match on ${p.host}`,
+            match_tier: isStrongMatch ? "verified" : "probable",
+            match_reason: `${isLiveVerified ? "Live-verified" : "Indexed"} public paste/leak (${matchedIdent}) on ${p.host}`,
           },
           url: p.url,
           depth: pDepth,
@@ -8321,12 +8669,13 @@ async function runInvestigation(caseId, input, auth) {
   }
 
   snap.engine_notices = Array.from(new Set(onionNotices));
+  emitStage("tor_darkweb", "Tor .onion & paste/exposure sweep complete", 86);
+  };
 
   // -------------------------------------------------------------------------
   // Stage 3B: Always-Armed Local Sovereign Corpus Scanner
   // -------------------------------------------------------------------------
-  const corpusDir = auth.local_corpus_dir?.trim() || DEFAULT_CORPUS_DIR;
-  emitStage("local_corpus", "Scanning local offline breach/paste corpus folder", 89);
+  const runLocalCorpusWave = async () => {
   emitTool("local-corpus", "running", 0, `Scanning ${path.basename(corpusDir)}`);
   const { filesScanned, hits: corpusHits } = await scanLocalCorpus(corpusDir, searchTerms);
   for (const hit of corpusHits) {
@@ -8376,13 +8725,15 @@ async function runInvestigation(caseId, input, auth) {
       ? "0 hits (drop files in corpus folder)"
       : `${corpusHits.length} hit(s) across ${filesScanned} file(s)`
   );
+  };
 
   // -------------------------------------------------------------------------
   // Stage 4: Local Python Open-Source Sidecar Bridge (sidecar/.venv)
   // -------------------------------------------------------------------------
-  emitStage("sidecar", `Running local open-source CLI sidecar tools (L${depthLevel} depth)`, 92);
+  const runSidecarWave = async () => {
   const sidecarProfileUrls = confirmedProfileUrls.map((x) => x[1]).slice(0, depthLevel >= 3 ? 10 : 6);
   const sidecarHandleLimit = { 1: 2, 2: 3, 3: 4, 4: 5 }[depthLevel] || 3;
+  const sidecarDomains = knownDomains.filter((d) => d && !FREE_MAIL_DOMAINS.has(d)).slice(0, 3);
   const pendingSidecarTasks = [];
   const verifiedUrlCache = new Map();
   let sidecarActiveVerifies = 0;
@@ -8445,28 +8796,38 @@ async function runInvestigation(caseId, input, auth) {
           return;
         }
 
-        // 2. onionsearch dark-web hits: route through identical deduplication, live verification & classification
+        // 2. onionsearch dark-web hits: live-probe snippet-less CSV URLs over Tor before classifying
         if (entityKind === "onion" || ev.tool === "onionsearch") {
           if (!ev.url || !ev.url.includes(".onion")) return;
           const matchedTerm = String(evMeta.matched_term || fullName).replace(/^["']+|["']+$/g, "").trim();
           const qType = matchedTerm.includes("@")
             ? "email"
+            : matchedTerm.includes(".") && !/\s/.test(matchedTerm)
+            ? "domain"
             : hasExactPhraseProximity(matchedTerm, fullName)
             ? "full_name"
             : "handle";
           const parentId = findAnchorForTerm(matchedTerm);
+          const canonO = normUrlForMatch(ev.url);
+          let livePage = null;
+          if (tor.available && canonO && !seenOnions.has(canonO) && sidecarOnionProbes < 4) {
+            seenOnions.add(canonO);
+            sidecarOnionProbes++;
+            livePage = await fetchOnionPageSnippet(tor.host, tor.port, ev.url, 10000).catch(() => null);
+          }
           await admitClassifiedOnion(
             {
               engine: evMeta.engine || "onionsearch",
               query: matchedTerm,
               title: ev.label || ev.url,
               url: ev.url,
-              snippet: ev.summary || "",
+              snippet: "",
             },
             matchedTerm,
             qType,
             parentId,
-            ev.tool || "onionsearch"
+            ev.tool || "onionsearch",
+            livePage
           );
           return;
         }
@@ -8624,10 +8985,15 @@ async function runInvestigation(caseId, input, auth) {
         });
       })();
       pendingSidecarTasks.push(task);
-    }
+    },
+    sidecarDomains
   );
 
   await Promise.allSettled(pendingSidecarTasks);
+  emitStage("sidecar", "Local sidecar verification complete", 96);
+  };
+
+  await Promise.allSettled([runTorDarkwebWave(), runLocalCorpusWave(), runSidecarWave()]);
   for (const t of snap.tool_runs || []) {
     if (t.state === "running") {
       emitTool(t.tool, "done", t.hits || 0, t.detail ? `${t.detail} (finalized)` : "Completed");

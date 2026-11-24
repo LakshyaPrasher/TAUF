@@ -44,7 +44,9 @@ _EMIT_LOCK = threading.Lock()
 _TERMINAL_TOOL_STATES = {"done", "skipped", "error"}
 _TERMINAL_EMITTED: set[str] = set()
 
-# Prepend sidecar/.venv/Scripts (or bin) to PATH so installed venv tools are always discoverable
+# Prepend sidecar/.venv/Scripts (or bin) to PATH and site-packages to sys.path/PYTHONPATH
+# so installed venv tools are always discoverable & importable even when an OS policy
+# requires running under a system Python interpreter instead of .venv/Scripts/python.exe.
 _SIDECAR_DIR = os.path.dirname(os.path.abspath(__file__))
 for _vbin in (
     os.path.join(_SIDECAR_DIR, ".venv", "Scripts"),
@@ -52,6 +54,28 @@ for _vbin in (
 ):
     if os.path.isdir(_vbin) and _vbin not in os.environ.get("PATH", ""):
         os.environ["PATH"] = _vbin + os.pathsep + os.environ.get("PATH", "")
+
+_VENV_SITE_DIRS: list[str] = []
+_win_sp = os.path.join(_SIDECAR_DIR, ".venv", "Lib", "site-packages")
+if os.path.isdir(_win_sp):
+    _VENV_SITE_DIRS.append(_win_sp)
+_unix_lib = os.path.join(_SIDECAR_DIR, ".venv", "lib")
+if os.path.isdir(_unix_lib):
+    try:
+        for _entry in os.listdir(_unix_lib):
+            _sp = os.path.join(_unix_lib, _entry, "site-packages")
+            if _entry.startswith("python") and os.path.isdir(_sp):
+                _VENV_SITE_DIRS.append(_sp)
+    except Exception:
+        pass
+for _sp in reversed(_VENV_SITE_DIRS):
+    if _sp not in sys.path:
+        sys.path.insert(0, _sp)
+if _VENV_SITE_DIRS:
+    _existing_pp = os.environ.get("PYTHONPATH", "")
+    _missing_pp = [p for p in _VENV_SITE_DIRS if p not in _existing_pp.split(os.pathsep)]
+    if _missing_pp:
+        os.environ["PYTHONPATH"] = os.pathsep.join(_missing_pp + ([_existing_pp] if _existing_pp else []))
 
 # High-signal curated site list for fast, reliable Sherlock execution over Tor
 # (Linktree, WordPress, TryHackMe, and Bandcamp excluded due to soft-404 / SPA false positives)
@@ -517,6 +541,10 @@ def run_sidecar(payload: dict[str, Any]) -> None:
 
     primary_handle = unique_handles[0] if unique_handles else ""
     primary_email = emails[0] if emails else ""
+    domains: list[str] = [
+        d.strip().lower() for d in _str_list(payload.get("domains")) if "." in d.strip()
+    ]
+    primary_domain = domains[0] if domains else ""
     proxy_label = " via Tor" if active_proxy else ""
 
     # Depth 1 (Quick): skip heavy external sidecar crawlers so Quick mode completes in ~20s
@@ -1070,19 +1098,36 @@ def run_sidecar(payload: dict[str, Any]) -> None:
             if not active_proxy:
                 emit({"kind": "tool_status", "tool": name, "state": "skipped", "hits": 0, "detail": "Tor offline"})
                 return
-            raw_query = full_name or primary_handle or primary_email
+            # Prefer high-specificity verified self-audit anchors when present, else full_name / handle
+            raw_query = primary_email or primary_domain or full_name or primary_handle
             if not raw_query:
                 emit({"kind": "tool_status", "tool": name, "state": "skipped", "hits": 0, "detail": "needs search term"})
                 return
-            if full_name and len(full_name.split()) > 1 and not (full_name.startswith('"') and full_name.endswith('"')):
+            if raw_query == full_name and len(full_name.split()) > 1 and not (full_name.startswith('"') and full_name.endswith('"')):
                 query = f'"{full_name}"'
             else:
                 query = raw_query
             p_url = urlparse(active_proxy)
             proxy_hp = f"{p_url.hostname or '127.0.0.1'}:{p_url.port or 9050}"
-            emit({"kind": "tool_status", "tool": name, "state": "running", "hits": 0, "detail": f"Querying live v3 .onion index via {proxy_hp}"})
+            v3_engines = ["onionland", "phobos", "tor66", "haystack"] if depth_level >= 3 else ["onionland", "phobos", "tor66"]
+            emit({"kind": "tool_status", "tool": name, "state": "running", "hits": 0, "detail": f"Querying {len(v3_engines)} live v3 .onion indexes via {proxy_hp}"})
             tmp_csv = os.path.join(tempfile.gettempdir(), f"tauf_os_{os.getpid()}_{int(time.time()*1000)}.csv")
-            argv = ["onionsearch", query, "--proxy", proxy_hp, "--engines", "onionland", "--limit", "1", "--output", tmp_csv]
+            argv = [
+                "onionsearch",
+                query,
+                "--proxy",
+                proxy_hp,
+                "--continuous_write",
+                "True",
+                "--mp_units",
+                str(len(v3_engines)),
+                "--engines",
+                *v3_engines,
+                "--limit",
+                "1",
+                "--output",
+                tmp_csv,
+            ]
             code = f"""
 import sys
 sys.argv = {json.dumps(argv)}
@@ -1102,23 +1147,27 @@ except Exception as exc:
                 if ln.startswith("TAUF_ONIONSEARCH_ERROR:"):
                     patch_error = ln[len("TAUF_ONIONSEARCH_ERROR:") :].strip()
                     break
-            found_onions: list[tuple[str, str]] = []
+            found_onions: list[tuple[str, str, str]] = []
             seen_o = set()
+            engine_self_hosts = (
+                "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd",
+                "3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad",
+                "phobosxilamwcg75xt22id7aywkzol6q6rfl2flipcqoc4e4ahima5id",
+                "tor66sewebgixwhcqfnp5inzp5x5uohhdy3kvtnyfxc2e5mxiuh34iid",
+                "haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid",
+            )
             try:
                 if os.path.exists(tmp_csv):
                     try:
                         with open(tmp_csv, "r", encoding="utf-8", errors="ignore") as f:
                             for row in csv.reader(f):
                                 if len(row) >= 3 and ".onion" in row[2]:
+                                    sub_eng = row[0].strip() or "onionsearch"
                                     title = row[1].strip() or "Tor Hidden Service"
                                     url = row[2].strip()
-                                    if (
-                                        url not in seen_o
-                                        and "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd" not in url
-                                        and "3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad" not in url
-                                    ):
+                                    if url not in seen_o and not any(eh in url for eh in engine_self_hosts):
                                         seen_o.add(url)
-                                        found_onions.append((title, url))
+                                        found_onions.append((sub_eng, title, url))
                     except Exception:
                         pass
             finally:
@@ -1127,7 +1176,7 @@ except Exception as exc:
                         os.remove(tmp_csv)
                 except Exception:
                     pass
-            for title, o in found_onions[:8]:
+            for sub_eng, title, o in found_onions[:10]:
                 emit(
                     {
                         "kind": "finding",
@@ -1138,17 +1187,17 @@ except Exception as exc:
                         "category": "darkweb",
                         "confidence": 0.72,
                         "match_tier": "probable",
-                        "match_reason": "OnionSearch live v3 .onion hit",
+                        "match_reason": f"OnionSearch ({sub_eng}) live v3 .onion hit",
                         "metadata": {
-                            "engine": "onionsearch",
+                            "engine": f"onionsearch:{sub_eng}",
                             "matched_term": raw_query,
                             "search_query": query,
                         },
-                        "summary": f"OnionSearch over Tor SOCKS5h returned '{title}' at {o}.",
+                        "summary": f"OnionSearch ({sub_eng}) over Tor SOCKS5h returned '{title}' at {o}.",
                     }
                 )
-            # SC-5: never report a killed/failed crawl as a clean 0-hit run.
-            if rc != 0:
+            # SC-5: never report a killed/failed crawl with 0 hits or patch error as a clean run.
+            if rc != 0 and (patch_error or rc != 124 or not found_onions):
                 tail = " | ".join(strip_ansi(ln).strip() for ln in lines[-3:] if ln.strip())
                 if patch_error:
                     detail = f"onionsearch monkey-patch/scrape failed: {patch_error}"
@@ -1159,12 +1208,13 @@ except Exception as exc:
                         "kind": "tool_status",
                         "tool": name,
                         "state": "error",
-                        "hits": len(found_onions[:8]),
+                        "hits": len(found_onions[:10]),
                         "detail": detail[:400],
                     }
                 )
                 return
-            emit({"kind": "tool_status", "tool": name, "state": "done", "hits": len(found_onions[:8]), "detail": f"{len(found_onions[:8])} .onion hit(s) via Tor"})
+            suffix = " (partial before timeout)" if rc == 124 else ""
+            emit({"kind": "tool_status", "tool": name, "state": "done", "hits": len(found_onions[:10]), "detail": f"{len(found_onions[:10])} .onion hit(s) across {len(v3_engines)} v3 engine(s){suffix}"})
 
     def _safe_run_one(spec: dict[str, Any]) -> None:
         name = spec["name"]

@@ -573,6 +573,116 @@ section("D2. queryAhmiaOnion walks mirrors on failure");
 }
 
 // ---------------------------------------------------------------------------
+// E. Owned-domain .onion snippet matching & expanded canonical URL extractors
+// ---------------------------------------------------------------------------
+section("E. Domain snippet exposure & canonical platform extractors");
+{
+  const {
+    classifyOnionHit,
+    extractSocialAccountFromUrl,
+    buildCanonicalProfileUrl,
+  } = makeApi(
+    [
+      "decodeHtmlEntities",
+      "getNameParts",
+      "normalizeNameText",
+      "escapeRegExp",
+      "nameEvidence",
+      "hasExactPhraseProximity",
+      "hasFullNameMatch",
+      "stripBoilerplateHtml",
+      "extractContextExcerpt",
+      "classifyOnionSitePurpose",
+      "classifyOnionHit",
+      "normalizePlatformSlug",
+      "buildCanonicalProfileUrl",
+      "extractSocialAccountFromUrl",
+    ],
+    {
+      PLATFORM_SLUG_ALIASES: {
+        "dev.to": "devto",
+        devto: "devto",
+        "github gist": "gist",
+        gist: "gist",
+        stackoverflow: "stackoverflow",
+        hackernews: "hackernews",
+        huggingface: "huggingface",
+        npm: "npm",
+        pypi: "pypi",
+        dockerhub: "dockerhub",
+        orcid: "orcid",
+      },
+      RESERVED_PATHS: new Set(["about", "login", "signup", "explore", "settings", "trending"]),
+    }
+  );
+
+  const domInBody = classifyOnionHit(
+    {
+      url: "http://z7x9k2p4q8m1n5v3b6c0d2f4g6h8j0k2l4m6n8p0q2r4s6t8u0v2w4ad.onion/thread/42",
+      title: "Config archive dump",
+      snippet: "Exposed staging endpoint referencing irah.co.in mail gateway.",
+      query: "irah.co.in",
+      engine: "OnionLand v3",
+    },
+    "irah.co.in",
+    "domain",
+    "Hari Kant Prasher",
+    null
+  );
+  check(
+    "[E] owned domain in .onion snippet (56-char base32 host) -> probable",
+    domInBody !== null && domInBody.match_tier === "probable" && domInBody.matched_identifier === "Domain: irah.co.in",
+    domInBody
+  );
+
+  const domLookalike = classifyOnionHit(
+    {
+      url: "http://z7x9k2p4q8m1n5v3b6c0d2f4g6h8j0k2l4m6n8p0q2r4s6t8u0v2w4ad.onion/thread/43",
+      title: "Config archive dump",
+      snippet: "Unrelated domain my-irah.co.in.example listed.",
+      query: "irah.co.in",
+      engine: "OnionLand v3",
+    },
+    "irah.co.in",
+    "domain",
+    "Hari Kant Prasher",
+    null
+  );
+  check("[E] domain lookalike boundary rejected -> null", domLookalike === null, domLookalike);
+
+  check(
+    "[E] dev.to extractor + canonical URL",
+    extractSocialAccountFromUrl("https://dev.to/alice_dev", "", "Alice")?.platform === "Dev.to" &&
+      buildCanonicalProfileUrl("Dev.to", "alice_dev") === "https://dev.to/alice_dev",
+    extractSocialAccountFromUrl("https://dev.to/alice_dev", "", "Alice")
+  );
+  check(
+    "[E] ORCID extractor + canonical URL",
+    extractSocialAccountFromUrl("https://orcid.org/0000-0002-1825-0097", "", "Alice")?.handle === "0000-0002-1825-0097" &&
+      buildCanonicalProfileUrl("ORCID", "0000-0002-1825-0097") === "https://orcid.org/0000-0002-1825-0097",
+    extractSocialAccountFromUrl("https://orcid.org/0000-0002-1825-0097", "", "Alice")
+  );
+  check(
+    "[E] PyPI & npm extractors",
+    extractSocialAccountFromUrl("https://pypi.org/user/alicepkg/", "", "Alice")?.platform === "PyPI" &&
+      extractSocialAccountFromUrl("https://www.npmjs.com/~alicenpm", "", "Alice")?.platform === "npm",
+    true
+  );
+  check(
+    "[E] Mastodon instance preserved",
+    extractSocialAccountFromUrl("https://fosstodon.org/@alice", "", "Alice")?.platform === "Mastodon:fosstodon.org" &&
+      buildCanonicalProfileUrl("Mastodon:fosstodon.org", "alice") === "https://fosstodon.org/@alice",
+    extractSocialAccountFromUrl("https://fosstodon.org/@alice", "", "Alice")
+  );
+  check(
+    "[E] Gist paste hex URL & story.php rejected as accounts",
+    extractSocialAccountFromUrl("https://gist.github.com/alice/0123456789abcdef0123", "", "Alice") === null &&
+      extractSocialAccountFromUrl("https://www.facebook.com/story.php?id=123", "", "Alice") === null,
+    true
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 console.log(`\n${pass} passed, ${fail} failed`);
