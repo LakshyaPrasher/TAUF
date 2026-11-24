@@ -25,6 +25,7 @@ const SUITES = [
   { id: "noise", label: "Unit / noise filtering", file: "tests/unit/noise.test.mjs", timeout: 120_000 },
   { id: "search_pool", label: "Unit / search pool", file: "tests/unit/search_pool.test.mjs", timeout: 120_000 },
   { id: "scheduler", label: "Unit / task scheduler", file: "tests/unit/scheduler.test.mjs", timeout: 120_000 },
+  { id: "pivots", label: "Unit / recursive pivots", file: "tests/unit/pivots.test.mjs", timeout: 120_000 },
   { id: "server", label: "Server / API integration", file: "tests/server/api.test.mjs", timeout: 180_000 },
   {
     id: "integration",

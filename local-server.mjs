@@ -17,10 +17,18 @@ import {
   shouldDropCollision,
 } from "./scripts/engine/noise_guard.mjs";
 import { StickyCircuitPool, runEngineWithRetry } from "./scripts/engine/search_pool.mjs";
+import { createScheduler } from "./scripts/engine/scheduler.mjs";
+import {
+  PIVOT_PRIORITY,
+  deriveEmailHandleCandidates,
+  fetchGravatarProfile,
+  crawlDomainIdentitySurface,
+  buildContextDisambiguationQueries,
+} from "./scripts/engine/pivots.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SERVER_BUILD_ID = "v6.0-core";
+const SERVER_BUILD_ID = "v6.0-recursive-frontier";
 
 const DIST_DIR = path.join(__dirname, "dist");
 const WMN_PATH = path.join(__dirname, "src-tauri", "resources", "wmn_curated.json");
@@ -4386,12 +4394,13 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
     return true;
   };
 
-  // 1. YouTube Search HTML over Tor (proven 200 OK over Tor!)
-  if (isAborted()) return out;
+  // 1. YouTube Search HTML over Tor (runs concurrently with search cascade!)
+  const runYoutubeDiscovery = async () => {
+  if (isAborted()) return;
   try {
     const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(fullName)}`;
     const r = await sovereignFetch(ytUrl, { maxBytes: 700_000, jitter: false }, netCtx, 11000);
-    if (isAborted()) return out;
+    if (isAborted()) return;
     if (r.ok) {
       const html = await r.text();
       const rawChunks = html.split(/"channelRenderer"\s*:\s*\{/).slice(1, 40);
@@ -4464,14 +4473,16 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
   } catch {
     // ignore
   }
+  };
 
-  // 2. Wikipedia Direct Biography Page over Tor
-  if (isAborted()) return out;
+  // 2. Wikipedia Direct Biography Page over Tor (runs concurrently!)
+  const runWikipediaDiscovery = async () => {
+  if (isAborted()) return;
   try {
     const wikiSlug = fullName.trim().split(/\s+/).join("_");
     const wikiUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(wikiSlug)}`;
     const rw = await sovereignFetch(wikiUrl, { maxBytes: 250_000, jitter: false }, netCtx, 9000);
-    if (isAborted()) return out;
+    if (isAborted()) return;
     if (rw.ok) {
       const html = await rw.text();
       const isDisambig =
@@ -4498,7 +4509,7 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
           category: "corporate",
         });
         for (const m of html.matchAll(/class="external[^"]*"[^>]+href="(https?:\/\/[^"]+)"/gi)) {
-          if (isAborted()) return out;
+          if (isAborted()) return;
           const u = m[1];
           if (/wikipedia\.org|wikimedia\.org|wikidata\.org|archive\.org/i.test(u)) continue;
           const socialAcc = extractSocialAccountFromUrl(u, fullName, fullName);
@@ -4524,9 +4535,10 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
   } catch {
     // ignore
   }
+  };
 
-  // 3. Direct public profile pages/HTML indicators for top handle permutations
-  //    (ONLY non-auth-walled platforms + strict full-name HTML verification — zero hallucinations!)
+  // 3. Direct public profile pages/HTML indicators for top handle permutations (runs concurrently!)
+  const runDirectProbesDiscovery = async () => {
   const permLimit = depthLevel === 1 ? 3 : depthLevel === 2 ? 4 : 5;
   const topPerms = (rankedHandles || []).slice(0, permLimit);
   if (topPerms.length > 0 && !isAborted()) {
@@ -4604,6 +4616,7 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
     };
     await Promise.all(Array.from({ length: 6 }, probeWorker));
   }
+  };
 
   // 4. Bulletproof Startpage-First Multi-Engine Direct-HTML Cascade (3-circuit IsolateSOCKSAuth retry)
   let circuitSeq = 0;
@@ -4686,6 +4699,14 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
       if (/(?:^|\.)(?:instagram\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|threads\.net)$/i.test(host)) {
         continue;
       }
+      if (/(?:^|\.)(?:wikipedia\.org|wikimedia\.org|wikidata\.org)$/i.test(host)) {
+        if (!isValidWikipediaBiography(item.url, item.title, item.snippet || "", fullName, nameEvidence)) {
+          continue;
+        }
+      }
+      if (host === "gist.github.com" && !/\/[a-f0-9]{16,}/i.test(item.url)) {
+        continue;
+      }
       if (seenUrls.has(item.url)) continue;
       seenUrls.add(item.url);
 
@@ -4727,7 +4748,31 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
     if (spRes.strictBlocked) return 0;
     if (spRes.ok) {
       matchedCount += processSearchItems("startpage", kind, spRes.items, filterPlatform);
-      // Do NOT fall through to backup engines when Startpage returned clean HTTP 200 OK HTML
+      // Union DDG-Lite on the primary general query so distinct search-index pages merge without extra cascades
+      if (kind === "general" && !isAborted()) {
+        const ddgEng = SEARCH_ENGINES.find((e) => e.id === "ddg-lite");
+        if (ddgEng && !shouldSkipEngine(declinedEngines.get("ddg-lite"))) {
+          try {
+            const dr = await sovereignFetch(
+              ddgEng.buildUrl(query),
+              { maxBytes: 420_000, jitter: false, socksUser: nextSocksUser() },
+              netCtx,
+              8500
+            );
+            if (dr.ok && !isAborted()) {
+              const dHtml = await dr.text();
+              if (!detectSearchChallenge(dr, dHtml)) {
+                const dItems = parseSearchResults("ddg-lite", dHtml);
+                if (!isEmptyParserResult(dItems, dHtml)) {
+                  matchedCount += processSearchItems("ddg-lite", kind, dItems, filterPlatform);
+                }
+              }
+            }
+          } catch {
+            // keep Startpage hits
+          }
+        }
+      }
       return matchedCount;
     }
     // Never permanently ban Startpage across queries — only record per-query notice if all 3 circuits failed
@@ -4818,11 +4863,21 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
   if (depthLevel >= 3) {
     dorkSpecs.push(["contact", `"${fullName}" ("@gmail.com" OR "@proton.me" OR "email" OR "contact")`]);
   }
-  for (let i = 0; i < dorkSpecs.length; i += 2) {
-    if (isAborted()) break;
-    const pair = dorkSpecs.slice(i, i + 2);
-    await Promise.all(pair.map(([k, q]) => runDorkCascade(k, q)));
-  }
+  const runDorksDiscovery = async () => {
+    for (let i = 0; i < dorkSpecs.length; i += 2) {
+      if (isAborted()) break;
+      const pair = dorkSpecs.slice(i, i + 2);
+      await Promise.all(pair.map(([k, q]) => runDorkCascade(k, q)));
+    }
+  };
+
+  // V6: run YouTube, Wikipedia biography, direct profile probes & multi-engine search dorks concurrently!
+  await Promise.allSettled([
+    runYoutubeDiscovery(),
+    runWikipediaDiscovery(),
+    runDirectProbesDiscovery(),
+    runDorksDiscovery(),
+  ]);
 
   return out;
 }
@@ -5034,6 +5089,11 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2, opts = {}
         if (/(?:^|\.)(?:instagram\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|threads\.net)$/i.test(host)) {
           continue;
         }
+        if (/(?:^|\.)(?:wikipedia\.org|wikimedia\.org|wikidata\.org)$/i.test(host)) {
+          if (!isValidWikipediaBiography(item.url, item.title, item.snippet || "", fullName, nameEvidence)) {
+            continue;
+          }
+        }
         if (seen.has(item.url)) continue;
         seen.add(item.url);
         records.push({
@@ -5076,6 +5136,11 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2, opts = {}
         }
         if (/(?:^|\.)(?:instagram\.com|linkedin\.com|facebook\.com|x\.com|twitter\.com|threads\.net)$/i.test(host)) {
           continue;
+        }
+        if (/(?:^|\.)(?:wikipedia\.org|wikimedia\.org|wikidata\.org)$/i.test(host)) {
+          if (!isValidWikipediaBiography(item.url, item.title, item.snippet || "", fullName, nameEvidence)) {
+            continue;
+          }
         }
         if (seen.has(item.url)) continue;
         seen.add(item.url);
@@ -8136,6 +8201,403 @@ async function runInvestigation(caseId, input, auth) {
     emitTool("html-extractor", "done", extHits, `${extHits} clean depth-2 pivot(s)`);
   } else {
     emitTool("html-extractor", "done", 0, "0 corroborated profiles to expand");
+  }
+
+  // -------------------------------------------------------------------------
+  // Stage 2R: Iterative & Recursive Multi-Hop Frontier Expansion (Hops 2..K)
+  // -------------------------------------------------------------------------
+  if (depthLevel >= 2) {
+    emitStage(
+      "recursive_frontier",
+      `Running recursive multi-hop frontier expansion (up to ${depthLevel} hops across emails, secondary handles, domains & orgs)`,
+      75
+    );
+    const frontierBudgetMs = { 2: 14_000, 3: 24_000, 4: 34_000 }[depthLevel] || 14_000;
+    const frontierCtrl = new AbortController();
+    const frontierTimer = setTimeout(() => {
+      if (!frontierCtrl.signal.aborted) frontierCtrl.abort();
+    }, frontierBudgetMs);
+    if (frontierTimer && typeof frontierTimer.unref === "function") frontierTimer.unref();
+
+    const frontier = createScheduler({ maxHops: depthLevel, signal: frontierCtrl.signal });
+    const frontierFetch = (u, fOpts = {}) =>
+      sovereignFetch(
+        u,
+        { maxBytes: fOpts.maxBytes || 49152, jitter: false, socksUser: stage0aCircuitPool.acquire() },
+        netCtx,
+        fOpts.timeoutMs || 7000
+      );
+
+    // Track handles already swept in Wave 1 WMN so only NEW secondary personas trigger Hop 2+ sweeps
+    const sweptWmnHandles = new Set(targetHandles.map((x) => x.toLowerCase()));
+    const seedHandleLower = String(input.handle || "").replace(/^@+/, "").trim().toLowerCase();
+
+    const enqueueHandlePivot = (rawHandle, parentId, hop) => {
+      const h = String(rawHandle || "").replace(/^@+/, "").trim().toLowerCase();
+      if (!h || h.length < 3 || h.includes("/") || sweptWmnHandles.has(h)) return;
+      frontier.enqueue({
+        id: `handle:${h}`,
+        priority: PIVOT_PRIORITY.HANDLE,
+        hop,
+        run: async () => {
+          sweptWmnHandles.add(h);
+          if (!knownHandles.includes(h)) knownHandles.push(h);
+          const hHubId = normalizeNodeId("handle", h);
+          const baseDepth = findNodeDepth(parentId);
+          if (!snap.nodes.some((n) => n.id === hHubId)) {
+            addNode({
+              id: hHubId,
+              kind: "handle",
+              label: `@${h}`,
+              sublabel: `Recursive Hop-${hop} Persona`,
+              layer: "anchor",
+              confidence: 0.86,
+              status: "unverified",
+              sources: ["recursive-frontier"],
+              metadata: { match_tier: "verified", match_reason: `Discovered recursively at hop ${hop}` },
+              url: null,
+              depth: baseDepth + 1,
+            });
+            addEdge(parentId || seedId, hHubId, "uses_handle", 0.86, "recursive-frontier");
+          }
+          const wHits = await runWmnForHandle(
+            h,
+            fullName,
+            knownOrgs,
+            knownDomains,
+            knownEmails,
+            h === seedHandleLower,
+            netCtx,
+            depthLevel >= 3 ? 45 : 30,
+            9500
+          );
+          for (const hit of wHits) {
+            if (frontierCtrl.signal.aborted) break;
+            if (hit.match_tier === "collision" || hit.match_tier === "drop") continue;
+            const acctId = normalizeAccountNodeId(hit.site_name, hit.handle);
+            addNode({
+              id: acctId,
+              kind: "account",
+              label: `${hit.site_name} (@${hit.handle})`,
+              sublabel: `Recursive Hop-${hop} · ${hit.category}`,
+              layer: hit.match_tier === "verified" ? "anchor" : "surface",
+              confidence: hit.confidence,
+              status: "unverified",
+              sources: ["wmn-native", "recursive-frontier"],
+              metadata: {
+                platform: hit.site_name,
+                handle: hit.handle,
+                title: hit.title,
+                bio: hit.description,
+                match_tier: hit.match_tier,
+                match_reason: `${hit.match_reason} (recursive hop ${hop})`,
+              },
+              url: hit.url,
+              depth: findNodeDepth(hHubId) + 1,
+            });
+            if (!hasParentEdge(acctId)) {
+              addEdge(hHubId, acctId, "account_on", hit.confidence, "recursive-frontier");
+            }
+            if (hit.match_tier === "verified" && confirmedProfileUrls.length < 12) {
+              confirmedProfileUrls.push([acctId, hit.url, [`Name: ${fullName}`, `Recursive @${h} -> ${hit.site_name}`]]);
+            }
+            // Extract outbound domains from verified secondary-persona accounts for Hop+1!
+            for (const outU of hit.outbound_urls || []) {
+              try {
+                const d = new URL(outU).hostname.replace(/^www\./, "").toLowerCase();
+                if (d && !FREE_MAIL_DOMAINS.has(d) && !PLATFORM_NOISE_DOMAINS.some((nd) => d === nd || d.endsWith(`.${nd}`))) {
+                  enqueueDomainPivot(d, acctId, hop + 1);
+                }
+              } catch {
+                // ignore
+              }
+            }
+          }
+        },
+      });
+    };
+
+    const enqueueEmailPivot = (rawEmail, parentId, hop) => {
+      const em = String(rawEmail || "").trim().toLowerCase();
+      if (!em || !em.includes("@") || isNoiseEmail(em) || generatedEmailSet.has(em)) return;
+      frontier.enqueue({
+        id: `email:${em}`,
+        priority: PIVOT_PRIORITY.EMAIL,
+        hop,
+        run: async () => {
+          const emId = normalizeNodeId("email", em);
+          // 1. Derive handle candidates from email local-part -> recursive handle sweep
+          for (const hc of deriveEmailHandleCandidates(em)) {
+            enqueueHandlePivot(hc, emId, hop + 1);
+          }
+          // 2. Public Gravatar self-published profile JSON (linked verified accounts, bio, websites)
+          const grav = await fetchGravatarProfile(em, { fetchFn: frontierFetch, signal: frontierCtrl.signal });
+          if (grav.found) {
+            if (grav.preferredUsername && grav.preferredUsername.length >= 4) {
+              enqueueHandlePivot(grav.preferredUsername, emId, hop + 1);
+            }
+            for (const gAcc of grav.accounts) {
+              const parsedAcc = extractSocialAccountFromUrl(gAcc.url, grav.displayName || fullName, fullName);
+              const plat = parsedAcc?.platform || gAcc.platform || "Profile";
+              const hnd = parsedAcc?.handle || gAcc.username;
+              if (!hnd || isBlockedSpaUrl(gAcc.url)) continue;
+              const gAcctId = normalizeAccountNodeId(plat, hnd);
+              addNode({
+                id: gAcctId,
+                kind: "account",
+                label: `${plat} (@${hnd})`,
+                sublabel: "Gravatar Linked Account",
+                layer: "anchor",
+                confidence: gAcc.verified ? 0.91 : 0.83,
+                status: "unverified",
+                sources: ["gravatar-profile", "recursive-frontier"],
+                metadata: {
+                  platform: plat,
+                  handle: hnd,
+                  bio: grav.bio || undefined,
+                  location: grav.location || undefined,
+                  match_tier: "verified",
+                  match_reason: `Linked on Gravatar profile for ${em}`,
+                },
+                url: parsedAcc?.url || gAcc.url,
+                depth: findNodeDepth(emId) + 1,
+              });
+              if (!hasParentEdge(gAcctId)) {
+                addEdge(emId, gAcctId, "same_as", gAcc.verified ? 0.91 : 0.83, "recursive-frontier");
+              }
+              enqueueHandlePivot(hnd, gAcctId, hop + 1);
+            }
+            for (const uObj of grav.urls) {
+              try {
+                const dom = new URL(uObj.url).hostname.replace(/^www\./, "").toLowerCase();
+                if (dom && !FREE_MAIL_DOMAINS.has(dom) && !PLATFORM_NOISE_DOMAINS.some((nd) => dom === nd || dom.endsWith(`.${nd}`))) {
+                  enqueueDomainPivot(dom, emId, hop + 1);
+                }
+              } catch {
+                // ignore
+              }
+            }
+          }
+        },
+      });
+    };
+
+    const enqueueDomainPivot = (rawDomain, parentId, hop) => {
+      const dom = String(rawDomain || "").trim().toLowerCase().replace(/^www\./, "");
+      if (!dom || !dom.includes(".") || FREE_MAIL_DOMAINS.has(dom)) return;
+      if (PLATFORM_NOISE_DOMAINS.some((nd) => dom === nd || dom.endsWith(`.${nd}`))) return;
+      frontier.enqueue({
+        id: `domain:${dom}`,
+        priority: PIVOT_PRIORITY.DOMAIN,
+        hop,
+        run: async () => {
+          if (!seenDomains.has(dom)) {
+            seenDomains.add(dom);
+            knownDomains.push(dom);
+          }
+          const domId = normalizeNodeId("domain", dom);
+          if (!snap.nodes.some((n) => n.id === domId)) {
+            addNode({
+              id: domId,
+              kind: "domain",
+              label: dom,
+              sublabel: `Recursive Hop-${hop} Domain`,
+              layer: "anchor",
+              confidence: 0.86,
+              status: "unverified",
+              sources: ["recursive-frontier"],
+              metadata: { match_tier: "verified", match_reason: `Discovered recursively at hop ${hop}` },
+              url: `https://${dom}`,
+              depth: findNodeDepth(parentId || seedId) + 1,
+            });
+            addEdge(parentId || seedId, domId, "links_to", 0.86, "recursive-frontier");
+          }
+          const surface = await crawlDomainIdentitySurface(dom, {
+            fetchFn: frontierFetch,
+            signal: frontierCtrl.signal,
+            maxPaths: depthLevel >= 3 ? 8 : 5,
+          });
+          for (const pdfU of surface.pdfUrls) {
+            if (!discoveredPdfUrls.includes(pdfU)) discoveredPdfUrls.push(pdfU);
+            pdfParentMap.set(pdfU, { parentId: domId, relation: "hosts_pdf" });
+          }
+          for (const em of surface.emails) {
+            if (isNoiseEmail(em)) continue;
+            const emId = normalizeNodeId("email", em);
+            addNode({
+              id: emId,
+              kind: "email",
+              label: em,
+              sublabel: `Domain Identity Route (${dom})`,
+              layer: "anchor",
+              confidence: 0.87,
+              status: "unverified",
+              sources: ["recursive-frontier"],
+              metadata: { match_tier: "verified", match_reason: `Extracted from ${dom} identity subpath` },
+              url: `https://${dom}`,
+              depth: findNodeDepth(domId) + 1,
+            });
+            addEdge(domId, emId, "mentions_email", 0.87, "recursive-frontier");
+            trackEmail(em);
+            enqueueEmailPivot(em, emId, hop + 1);
+          }
+          for (const sa of surface.sameAsUrls) {
+            const saAcc = extractSocialAccountFromUrl(sa, fullName, fullName);
+            if (!saAcc || isBlockedSpaUrl(saAcc.url)) continue;
+            const saId = normalizeAccountNodeId(saAcc.platform, saAcc.handle);
+            addNode({
+              id: saId,
+              kind: "account",
+              label: `${saAcc.platform} (@${saAcc.handle})`,
+              sublabel: `Linked from ${dom}`,
+              layer: "anchor",
+              confidence: 0.88,
+              status: "unverified",
+              sources: ["recursive-frontier"],
+              metadata: {
+                platform: saAcc.platform,
+                handle: saAcc.handle,
+                match_tier: "verified",
+                match_reason: `Linked from verified domain ${dom}`,
+              },
+              url: saAcc.url,
+              depth: findNodeDepth(domId) + 1,
+            });
+            if (!hasParentEdge(saId)) {
+              addEdge(domId, saId, "same_as", 0.88, "recursive-frontier");
+            }
+            enqueueHandlePivot(saAcc.handle, saId, hop + 1);
+          }
+        },
+      });
+    };
+
+    // Seed Hop-2 frontier from all verified anchors gathered in Hop 1
+    for (const em of [...knownEmails]) {
+      enqueueEmailPivot(em, normalizeNodeId("email", em), 2);
+    }
+    for (const h of [...knownHandles]) {
+      if (!sweptWmnHandles.has(h.toLowerCase())) {
+        enqueueHandlePivot(h, findHandleHubOrAccount(h) || seedId, 2);
+      }
+    }
+    for (const dom of knownDomains.filter((d) => d && !FREE_MAIL_DOMAINS.has(d))) {
+      enqueueDomainPivot(dom, normalizeNodeId("domain", dom), 2);
+    }
+
+    // Enqueue disambiguated Org / Domain context queries to uncover buried institutional records & PDFs
+    const ctxQueries = buildContextDisambiguationQueries(
+      fullName,
+      knownOrgs,
+      knownDomains.filter((d) => d && !FREE_MAIL_DOMAINS.has(d)),
+      depthLevel >= 3 ? 3 : 2
+    );
+    let ctxSeq = 0;
+    const nextCtxSocks = () => stage0aCircuitPool.acquire() || `tauf-ctx-${++ctxSeq}`;
+    for (const cq of ctxQueries) {
+      frontier.enqueue({
+        id: `ctx:${cq.query.toLowerCase()}`,
+        priority: PIVOT_PRIORITY.CONTEXT,
+        hop: 2,
+        run: async () => {
+          const spRes = await queryStartpageWithRetry(
+            cq.query,
+            netCtx,
+            nextCtxSocks,
+            13000,
+            { signal: frontierCtrl.signal, circuitPool: stage0aCircuitPool }
+          );
+          if (!spRes.ok) return;
+          for (const item of spRes.items.slice(0, 8)) {
+            if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
+            if (!hasFullNameMatch(`${item.title} ${item.snippet}`, fullName)) continue;
+            if (/\.pdf(?:$|[?#])/i.test(item.url)) {
+              if (!discoveredPdfUrls.includes(item.url)) {
+                discoveredPdfUrls.push(item.url);
+                pdfMetaMap.set(item.url, {
+                  title: item.title,
+                  snippet: item.snippet,
+                  parentRecordId: seedId,
+                  verifiedFromSearch: nameEvidence(`${item.title} ${item.snippet}`, fullName).strong,
+                });
+              }
+              continue;
+            }
+            const acc = extractSocialAccountFromUrl(item.url, item.title, fullName);
+            if (acc) {
+              const nameEv = nameEvidence(`${item.title} ${item.snippet}`, fullName);
+              if (!nameEv.proximity && !sharesNameToken(acc.handle, fullName)) continue;
+              const acctId = normalizeAccountNodeId(acc.platform, acc.handle);
+              addNode({
+                id: acctId,
+                kind: "account",
+                label: `${acc.platform} (@${acc.handle})`,
+                sublabel: `${acc.platform} · Disambiguated (${cq.anchor})`,
+                layer: nameEv.strong ? "anchor" : "surface",
+                confidence: nameEv.strong ? 0.87 : 0.76,
+                status: "unverified",
+                sources: ["recursive-frontier"],
+                metadata: {
+                  platform: acc.platform,
+                  handle: acc.handle,
+                  title: item.title,
+                  bio: item.snippet,
+                  match_tier: nameEv.strong ? "verified" : "probable",
+                  match_reason: `Disambiguated search (${cq.anchor})`,
+                },
+                url: acc.url,
+                depth: 1,
+              });
+              if (!hasParentEdge(acctId)) {
+                addEdge(seedId, acctId, "account_on", nameEv.strong ? 0.87 : 0.76, "recursive-frontier");
+              }
+              if (nameEv.strong) enqueueHandlePivot(acc.handle, acctId, 3);
+              continue;
+            }
+            let rHost = "";
+            try {
+              rHost = new URL(item.url).hostname.replace(/^www\./, "").toLowerCase();
+            } catch {
+              continue;
+            }
+            if (/(?:^|\.)(?:wikipedia\.org|wikimedia\.org|wikidata\.org)$/i.test(rHost)) {
+              if (!isValidWikipediaBiography(item.url, item.title, item.snippet || "", fullName, nameEvidence)) continue;
+            }
+            if (rHost === "gist.github.com" && !/\/[a-f0-9]{16,}/i.test(item.url)) continue;
+            const recId = normalizeNodeId("record", item.url);
+            if (!snap.nodes.some((n) => n.id === recId)) {
+              const recType = inferRecordType(item.url, item.title, item.snippet, "Public Web Record");
+              addNode({
+                id: recId,
+                kind: "record",
+                label: (item.title || rHost).slice(0, 72),
+                sublabel: `${rHost} · ${cq.anchor}`,
+                layer: "surface",
+                confidence: 0.82,
+                status: "unverified",
+                sources: ["recursive-frontier"],
+                metadata: {
+                  source: rHost,
+                  record_type: recType,
+                  bio: item.snippet,
+                  match_tier: "verified",
+                  match_reason: `Disambiguated context match (${cq.anchor})`,
+                },
+                url: item.url,
+                depth: 1,
+              });
+              addEdge(seedId, recId, "public_record", 0.82, "recursive-frontier");
+            }
+          }
+        },
+      });
+    }
+
+    try {
+      await frontier.run();
+    } finally {
+      clearTimeout(frontierTimer);
+    }
   }
 
   // -------------------------------------------------------------------------
