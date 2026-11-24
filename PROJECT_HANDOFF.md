@@ -287,21 +287,21 @@ All V5.1 gates were independently executed and signed off by `@qa-osint` (`#57`)
 | **Zero Hardcoded User Paths** | Path audit across `launch-*`, `local-server.mjs`, `sidecar/bridge.py`, `src/**`, `scripts/**` | **PASS** (**0** violations) |
 | **WMN 3-Canary Audit (Live Tor)** | `zqxjkvcanaryx`, `qxjv9284zpl`, `zqxjkv_canary_982741` across `70` sites | **PASS** (**201** negatives, `9` Tor timeouts, **`FALSE_POSITIVES = 0`**) |
 
-### 7.2 Primary Benchmark — `"Lakshya Parashar"` 3x Repeatability (`depth_level: 3`, Tor Strict)
+### 7.2 Primary Benchmark — `Subject A` 3x Repeatability (`depth_level: 3`, Tor Strict)
 
 | Run | Elapsed | Nodes / Edges / Findings | BFS Depth (`0 / 1 / 2 / 3+`) | Orphans / Self-Loops / Broken | Dup Accounts / Dead 404s | Key Verified Discoveries |
 |---|---|---|---|---|---|---|
-| **Run 1** | `278.5s` | `46 / 46 / 43` | `1 / 27 / 16 / 2` | `0 / 0 / 0` | `0 / 0` | **IG** (`@lakshyaparashar`, `@parasharlakshya`), **4 LinkedIn**, **2 FB**, **5 YT**, 2 GitHub, GitLab, Dev.to, Pinterest, Telegram, Tumblr, X/Twitter, Discord, Freelancer, `lakshyaparashar1608@gmail.com` + `holehe` (`replit.com`, `spotify.com`) |
-| **Run 2** | `168.0s` | `33 / 34 / 30` | `1 / 12 / 18 / 2` | `0 / 0 / 0` | `0 / 0` | **5 YT**, 2 GitHub, GitLab, Dev.to, Pinterest, Telegram, Tumblr, X/Twitter, TikTok, SoundCloud, Twitch, Freelancer, `lakshyaparashar1608@gmail.com` + `holehe` (honest Startpage Tor exit challenge telemetry) |
-| **Run 3** | `327.8s` | `48 / 47 / 46` | `1 / 29 / 16 / 2` | `0 / 0 / 0` | `0 / 0` | **IG** (`@lakshyaparashar`, `@parasharlakshya`), **4 LinkedIn**, **2 FB**, **5 YT**, 2 GitHub, GitLab, Dev.to, Kaggle, Pinterest, Telegram, TikTok, Tumblr, X/Twitter, Freelancer, `lakshyaparashar1608@gmail.com` + `holehe` |
+| **Run 1** | `278.5s` | `46 / 46 / 43` | `1 / 27 / 16 / 2` | `0 / 0 / 0` | `0 / 0` | **IG** (`@subject_a`, `@subject_a_alt`), **4 LinkedIn**, **2 FB**, **5 YT**, 2 GitHub, GitLab, Dev.to, Pinterest, Telegram, Tumblr, X/Twitter, Discord, Freelancer, `subject.a@example.com` + `holehe` (`replit.com`, `spotify.com`) |
+| **Run 2** | `168.0s` | `33 / 34 / 30` | `1 / 12 / 18 / 2` | `0 / 0 / 0` | `0 / 0` | **5 YT**, 2 GitHub, GitLab, Dev.to, Pinterest, Telegram, Tumblr, X/Twitter, TikTok, SoundCloud, Twitch, Freelancer, `subject.a@example.com` + `holehe` (honest Startpage Tor exit challenge telemetry) |
+| **Run 3** | `327.8s` | `48 / 47 / 46` | `1 / 29 / 16 / 2` | `0 / 0 / 0` | `0 / 0` | **IG** (`@subject_a`, `@subject_a_alt`), **4 LinkedIn**, **2 FB**, **5 YT**, 2 GitHub, GitLab, Dev.to, Kaggle, Pinterest, Telegram, TikTok, Tumblr, X/Twitter, Freelancer, `subject.a@example.com` + `holehe` |
 
 ### 7.3 General-Purpose Benchmarks, Collision Guard & Live `.onion` Clarity
 
 | Subject | Elapsed | Nodes / Edges | BFS Depth (`0 / 1 / 2 / 3+`) | Integrity & 404s | Verified Highlights |
 |---|---|---|---|---|---|
-| **Mitchell Hashimoto** (`L3`) | `291.9s` | `77 / 85` | `1 / 25 / 36 / 15` | `0` orphans/loops/broken/dups/404s | 3 emails (`m@mitchellh.com`, `mitchell.hashimoto@gmail.com`, `xmitchx@gmail.com`), 3 OpenPGP keys, Git `.patch`, 4+ arXiv/PDFs (`doc-meta`), 5 `holehe` services branched from emails |
-| **Linus Torvalds** (`L2` `.onion`) | `222.9s` | `78 / 77` | Multi-hop verified | `0` missing fields / `0` spam | **8 verified `.onion` hits** (`3 live_verified`, `5 index_only`), 100% populated `site_category`, `site_purpose`, `where_found`, `matched_identifier`, `match_precision`, `page_status`, `engine`, `context_excerpt` |
-| **Snigdha Prashar** (Collision check) | Live check | `20` nodes | Verified | **0** foreign leaks | `@sprashar` & `@prashar` kept `collision`; `neeraj.prashar@gmail.com`, `sprashar@ajooba.ca`, `domain:ajooba.ca` **0** leaks; `instagram@snigdhaprashar` `verified` |
+| **Subject B (OSS Maintainer)** (`L3`) | `291.9s` | `77 / 85` | `1 / 25 / 36 / 15` | `0` orphans/loops/broken/dups/404s | 3 emails (`b@example.com`, `subject.b@example.com`, `alt.b@example.com`), 3 OpenPGP keys, Git `.patch`, 4+ arXiv/PDFs (`doc-meta`), 5 `holehe` services branched from emails |
+| **Subject C (Kernel Maintainer)** (`L2` `.onion`) | `222.9s` | `78 / 77` | Multi-hop verified | `0` missing fields / `0` spam | **8 verified `.onion` hits** (`3 live_verified`, `5 index_only`), 100% populated `site_category`, `site_purpose`, `where_found`, `matched_identifier`, `match_precision`, `page_status`, `engine`, `context_excerpt` |
+| **Subject D (Collision check)** | Live check | `20` nodes | Verified | **0** foreign leaks | `@s_collision` & `@surname_only` kept `collision`; foreign emails & domains **0** leaks; `instagram@subject_d` `verified` |
 
 ### 7.4 Privacy Guardrails & Live Visual/UI QA (`#56`, `#57`)
 
@@ -369,10 +369,10 @@ Once `src-tauri\target\release\tauf.exe` exists, `launch-tauf.cmd` automatically
 - **V5.2 Gate 1 (Static, Build, Sidecar, Portability):** `npm run build`, `node --check local-server.mjs`, `sidecar/bridge.py` `py_compile` & `--probe` (`7/7` wired tools, `0` phantoms), `rustfmt --check`, `0` external OSINT SaaS APIs, `0` hardcoded user paths — all **PASS** (`exit 0`).
 - **70-Site WMN 3-Canary Audit (`zqxjkvcanaryx`, `qxjv9284zpl`, `zqxjkv_canary_982741` over Tor):** `204` negatives, `6` Tor timeouts, **`FALSE_POSITIVES = 0`**.
 - **5-Subject General-Purpose Repeatability Matrix (`enable_tor: true`, `strict_anonymity: true`, `passive_only: false`, `0` orphans/self-loops/broken edges/dead 404s/duplicates across all 8 runs):**
-  - **Hari Kant Prasher** (Run 1 `27/26`, Run 2 `25/24` L3): **100% repeatable** (`LinkedIn (@hari-kant-prasher-0741365)`, `irah.co.in`, `IRAH Services LLP`, `Falcon Ebiz` Corporate Filing, `10` MGT-7 / Annual Return PDFs parsed).
-  - **Snigdha Prashar** (Run 1 `30/29`, Run 2 `37/36` L3): **100% repeatable core** (`snigdhaprashar.in` + `/resume`/`/projects`/`/contact`, `Instagram (@snigdhaprashar)`, `LinkedIn` ×2, `6` records, `5` PDFs, **`0` foreign surname leaks**).
-  - **Lakshya Prasher** (Run 1 `29/30`, Run 2 `30/31` L3): **100% repeatable core** (`GitHub (@lakshyaprasher)`, `.patch` email `lakshya.prasher@gmail.com`, `Instagram (@laksh._.ya)`, `YouTube (@lakshyaprasher132)`, `holehe` services, `5–6` DPS-MIS/SOF PDFs with title & bio preserved).
-  - **Mitchell Hashimoto** (`92/96` L3): `mitchellh.com`, `4` emails, `29` corroborated accounts, `10` public records, `11` arXiv/technical PDFs (`12` hits).
+  - **Subject E (Corporate Filing)** (Run 1 `27/26`, Run 2 `25/24` L3): **100% repeatable** (`LinkedIn (@subject-e)`, `example-corp.in`, `Example Services LLP`, Corporate Filing, `10` MGT-7 / Annual Return PDFs parsed).
+  - **Subject D (Collision Check)** (Run 1 `30/29`, Run 2 `37/36` L3): **100% repeatable core** (`subjectd.in` + `/resume`/`/projects`/`/contact`, `Instagram (@subject_d)`, `LinkedIn` ×2, `6` records, `5` PDFs, **`0` foreign surname leaks**).
+  - **Subject A (Primary)** (Run 1 `29/30`, Run 2 `30/31` L3): **100% repeatable core** (`GitHub (@subject_a)`, `.patch` email `subject.a@example.com`, `Instagram (@subject_a_ig)`, `YouTube (@subject_a_yt)`, `holehe` services, `5–6` public PDFs with title & bio preserved).
+  - **Subject B (OSS Maintainer)** (`92/96` L3): `subjectb.dev`, `4` emails, `29` corroborated accounts, `10` public records, `11` arXiv/technical PDFs (`12` hits).
   - **Zqxjkv Plmnqrst** (`1/0` L2 synthetic non-existent canary): **`0` accounts, `0` records, `0` PDFs, `0` emails, `0` domains, `0` dark-web hits** (zero hallucinations).
 
 ### 9.3 Remaining Polish for Next Session Pickup
