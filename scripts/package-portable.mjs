@@ -512,6 +512,14 @@ if (OPT.verify && !OPT.dryRun) {
       if (f.endsWith(".mjs") || f.endsWith(".js")) nodeChecks.push(path.join("scripts", f));
     }
   }
+  // Engine modules live one level deeper (scripts/engine/*.mjs) and are imported
+  // by local-server.mjs, so a copy that loses them must fail the check.
+  const engineDir = path.join(OUT, "scripts", "engine");
+  if (fs.existsSync(engineDir)) {
+    for (const f of fs.readdirSync(engineDir)) {
+      if (f.endsWith(".mjs") || f.endsWith(".js")) nodeChecks.push(path.join("scripts", "engine", f));
+    }
+  }
   for (const rel of nodeChecks) {
     const abs = path.join(OUT, rel);
     if (!fs.existsSync(abs)) continue;

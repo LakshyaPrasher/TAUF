@@ -402,26 +402,6 @@
       "m_code": 404
     },
     {
-      "name": "Wikipedia",
-      "category": "account",
-      "uri_check": "https://en.wikipedia.org/wiki/User:{account}",
-      "uri_pretty": "https://en.wikipedia.org/wiki/User:{account}",
-      "e_code": 200,
-      "e_string": "Wikipedia",
-      "m_string": "Wikipedia does not have a user page with this exact name",
-      "m_code": 404
-    },
-    {
-      "name": "Gist",
-      "category": "code",
-      "uri_check": "https://gist.github.com/{account}",
-      "uri_pretty": "https://gist.github.com/{account}",
-      "e_code": 200,
-      "e_string": "gist.github.com",
-      "m_string": "Not Found",
-      "m_code": 404
-    },
-    {
       "name": "Sessionize",
       "category": "corporate",
       "uri_check": "https://sessionize.com/{account}/",

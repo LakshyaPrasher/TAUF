@@ -10,10 +10,17 @@ import tls from "node:tls";
 import zlib from "node:zlib";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  generateHighPrecisionHandles,
+  isValidWikipediaBiography,
+  isEmptyOrBoilerplateGist,
+  shouldDropCollision,
+} from "./scripts/engine/noise_guard.mjs";
+import { StickyCircuitPool, runEngineWithRetry } from "./scripts/engine/search_pool.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SERVER_BUILD_ID = "v5.5-exposure-parity";
+const SERVER_BUILD_ID = "v6.0-core";
 
 const DIST_DIR = path.join(__dirname, "dist");
 const WMN_PATH = path.join(__dirname, "src-tauri", "resources", "wmn_curated.json");
@@ -1974,38 +1981,13 @@ function normalizeDomain(domain, org) {
 }
 
 function generateHandles(fullName, seedHandle) {
-  const out = [];
-  const seen = new Set();
-  const push = (handle, pattern) => {
-    const clean = String(handle || "")
-      .trim()
-      .replace(/^@/, "")
-      .toLowerCase()
-      .replace(/[^a-z0-9._\-]/g, "");
-    if (clean.length >= 2 && !seen.has(clean)) {
-      seen.add(clean);
-      out.push({ handle: clean, pattern });
-    }
-  };
-  if (seedHandle) push(seedHandle, "seed_handle");
-  const parts = getNameParts(fullName);
-  if (parts.length >= 2) {
-    const first = parts[0];
-    const last = parts[parts.length - 1];
-    // Specific full-name handles first (much lower collision rate than flast)
-    push(`${first}${last}`, "firstlast");
-    push(`${first}.${last}`, "first.last");
-    push(`${first}-${last}`, "first-last");
-    push(`${first}_${last}`, "first_last");
-    push(`${first[0]}${last}`, "flast");
-    if (last.length >= 6) {
-      push(last, "lastname");
-    }
-    push(`${last}${first[0]}`, "lastf");
-  } else if (parts.length === 1) {
-    push(parts[0], "single");
-  }
-  return out;
+  // V6: delegate to the compound-only high-precision generator. The seed is
+  // always kept; bare surnames and "flast"-style guesses come from the guarded
+  // module. Map its "seed" pattern back to the call-site's "seed_handle".
+  return generateHighPrecisionHandles(fullName, seedHandle).map((entry) => ({
+    handle: entry.handle,
+    pattern: entry.pattern === "seed" ? "seed_handle" : entry.pattern,
+  }));
 }
 
 function generateCorporateEmails(fullName, domain, seedEmail) {
@@ -2997,6 +2979,8 @@ async function runWmnForHandle(
         if (site.m_string && body.includes(site.m_string.toLowerCase())) continue;
         if (site.e_string && !body.includes(site.e_string.toLowerCase())) continue;
         if (soft404.some((m) => body.includes(m))) continue;
+        // V6: a Gist user page with no public gists / no snippet is an empty shell.
+        if (/gist\.github\.com/i.test(prettyUrl) && isEmptyOrBoilerplateGist(rawHtml)) continue;
 
         const signals = extractPageSignals(rawHtml, prettyUrl);
         const scored = scoreProfileMatch(
@@ -3009,6 +2993,18 @@ async function runWmnForHandle(
           site.name,
           clean
         );
+
+        // V6 noise gate: contradictory names, brand-only shells and zero-signal
+        // stranger collisions never become account hits. A seed handle keeps its
+        // existing quarantine (collision) behaviour for brand-only pages.
+        const seedBrandShell =
+          isSeedHandle === true && scored.match_tier === "collision";
+        if (
+          !seedBrandShell &&
+          shouldDropCollision(signals, scored, fullName, isSeedHandle === true)
+        ) {
+          continue;
+        }
 
         hits.push({
           site_name: site.name,
@@ -3050,6 +3046,8 @@ async function extractProfileHtml(url, netCtx) {
     const resp = await sovereignFetch(url, { maxBytes: 240_000 }, netCtx, 10000);
     if (!resp.ok) return null;
     const rawHtml = (await resp.text()).slice(0, 220_000);
+    // V6: an empty / boilerplate Gist shell is not a profile page.
+    if (/gist\.github\.com/i.test(url) && isEmptyOrBoilerplateGist(rawHtml)) return null;
     const emails = new Set();
     const same_as_urls = new Set();
     const orgs = new Set();
@@ -4080,42 +4078,65 @@ function isEmptyParserResult(items, html) {
 }
 
 
+// V6: one shared pool of proven IsolateSOCKSAuth circuits for the search
+// cascade. A clean parse marks its token sticky and later queries reuse it; a
+// challenge/timeout/parser-empty evicts the token immediately.
+const startpageCircuitPool = new StickyCircuitPool({
+  maxSlots: 2,
+  makeToken: () =>
+    `tauf-sp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+});
+
 /**
- * Resilient Startpage-over-Tor helper with up to 3 total attempts (initial + 2 retries)
- * across 3 distinct RFC 1929 IsolateSOCKSAuth circuits on BOTH challenge and timeout/network error.
+ * Resilient Startpage-over-Tor helper, now backed by V6 sticky circuits and
+ * `runEngineWithRetry`. A large 200 OK page that parses to zero rows is treated
+ * as a parser failure and retried on a fresh circuit — including attempt 0,
+ * which the old cascade aborted.
  */
-async function queryStartpageWithRetry(query, netCtx, nextSocksUser, timeoutMs = 15000) {
-  const spUrl = `https://www.startpage.com/sp/search?query=${encodeURIComponent(query)}`;
+async function queryStartpageWithRetry(query, netCtx, nextSocksUser, timeoutMs = 15000, opts = {}) {
+  const spEngine = SEARCH_ENGINES.find((engine) => engine.id === "startpage");
+  const spUrl = spEngine
+    ? spEngine.buildUrl(query)
+    : `https://www.startpage.com/sp/search?query=${encodeURIComponent(query)}`;
   const maxAttempts = netCtx?.proxyHost ? 3 : 1;
-  let lastReason = "timeout";
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      const r = await sovereignFetch(
-        spUrl,
-        { maxBytes: 450_000, jitter: false, socksUser: nextSocksUser() },
-        netCtx,
-        timeoutMs
-      );
-      const html = r.ok ? await r.text() : "";
-      const challenge = detectSearchChallenge(r, html);
-      if (!challenge && r.ok) {
-        const items = parseSearchResults("startpage", html);
-        // Large 200 page with zero parsed rows = parser/anti-bot failure. Stop
-        // retrying this engine for the query and let the cascade fall through.
-        if (isEmptyParserResult(items, html)) {
-          return { ok: false, items: [], reason: "parser_empty" };
+  let strictBlocked = false;
+
+  const result = await runEngineWithRetry({
+    engineId: "startpage",
+    query,
+    circuitPool: opts.circuitPool || startpageCircuitPool,
+    fetchPage: async ({ socksUser, timeoutMs: attemptTimeoutMs }) => {
+      try {
+        return await sovereignFetch(
+          spUrl,
+          { maxBytes: 450_000, jitter: false, socksUser },
+          netCtx,
+          attemptTimeoutMs || timeoutMs
+        );
+      } catch (err) {
+        if (String(err?.message || "").includes("STRICT_ANONYMITY_BLOCKED")) {
+          strictBlocked = true;
         }
-        return { ok: true, items, reason: null };
+        throw err;
       }
-      lastReason = challenge || `HTTP ${r.status}`;
-    } catch (err) {
-      if (String(err?.message || "").includes("STRICT_ANONYMITY_BLOCKED")) {
-        return { ok: false, items: [], reason: "STRICT_ANONYMITY_BLOCKED", strictBlocked: true };
-      }
-      lastReason = "timeout";
-    }
+    },
+    parseResults: parseSearchResults,
+    detectChallenge: detectSearchChallenge,
+    isEmptyResult: isEmptyParserResult,
+    maxAttempts,
+    timeoutMs,
+    signal: opts.signal,
+  });
+
+  if (strictBlocked) {
+    return { ok: false, items: [], reason: "STRICT_ANONYMITY_BLOCKED", strictBlocked: true };
   }
-  return { ok: false, items: [], reason: lastReason };
+  if (result.ok) return { ok: true, items: result.items, reason: null };
+  return {
+    ok: false,
+    items: [],
+    reason: result.reason || (result.attempts ? "parser_empty" : "timeout"),
+  };
 }
 
 const AGGREGATOR_OR_DIRECTORY_HOSTS = [
@@ -4332,7 +4353,9 @@ function extractSocialAccountFromUrl(rawHref, title, fullName) {
  * - Direct clean public HTML profile verification for top handle permutations
  * - Respectful multi-engine direct-HTML public search cascade (Startpage, DDG Lite, DDG HTML, Brave, Mojeek)
  */
-async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHandles = [], contextTerms = []) {
+async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHandles = [], contextTerms = [], opts = {}) {
+  const signal = opts && opts.signal ? opts.signal : null;
+  const isAborted = () => Boolean(signal && signal.aborted);
   const out = {
     accounts: [], // [{ platform, handle, url, title, bio, confidence, match_tier, match_reason }]
     records: [], // [{ title, url, source, snippet, category, pdfs?, websites? }]
@@ -4364,9 +4387,11 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
   };
 
   // 1. YouTube Search HTML over Tor (proven 200 OK over Tor!)
+  if (isAborted()) return out;
   try {
     const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(fullName)}`;
     const r = await sovereignFetch(ytUrl, { maxBytes: 700_000, jitter: false }, netCtx, 11000);
+    if (isAborted()) return out;
     if (r.ok) {
       const html = await r.text();
       const rawChunks = html.split(/"channelRenderer"\s*:\s*\{/).slice(1, 40);
@@ -4441,26 +4466,39 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
   }
 
   // 2. Wikipedia Direct Biography Page over Tor
+  if (isAborted()) return out;
   try {
     const wikiSlug = fullName.trim().split(/\s+/).join("_");
     const wikiUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(wikiSlug)}`;
     const rw = await sovereignFetch(wikiUrl, { maxBytes: 250_000, jitter: false }, netCtx, 9000);
+    if (isAborted()) return out;
     if (rw.ok) {
       const html = await rw.text();
       const isDisambig =
         html.includes("Wikipedia does not have an article with this exact name") ||
         /id=["']disambigbox["']|\/wiki\/Help:Disambiguation|wgCategories[^\n]*Disambiguation|\bmay refer to:/i.test(html);
-      if (!isDisambig) {
+      const finalWikiUrl = rw.url || wikiUrl;
+      const wikiTitleM = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
+      const wikiPageTitle = wikiTitleM ? decodeHtmlEntities(wikiTitleM[1]) : `${fullName} - Wikipedia`;
+      const bioValid = isValidWikipediaBiography(
+        finalWikiUrl,
+        wikiPageTitle,
+        html,
+        fullName,
+        nameEvidence
+      );
+      if (!isDisambig && bioValid) {
         const pM = html.match(/<p[^>]*>([\s\S]{40,600}?)<\/p>/i);
         const snippet = pM ? decodeHtmlEntities(pM[1].replace(/<[^>]+>/g, " ")).slice(0, 220) : `Wikipedia biography for ${fullName}`;
         out.records.push({
           title: `${fullName} — Wikipedia Biography`,
-          url: wikiUrl,
+          url: finalWikiUrl,
           source: "Wikipedia",
           snippet,
           category: "corporate",
         });
         for (const m of html.matchAll(/class="external[^"]*"[^>]+href="(https?:\/\/[^"]+)"/gi)) {
+          if (isAborted()) return out;
           const u = m[1];
           if (/wikipedia\.org|wikimedia\.org|wikidata\.org|archive\.org/i.test(u)) continue;
           const socialAcc = extractSocialAccountFromUrl(u, fullName, fullName);
@@ -4491,7 +4529,7 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
   //    (ONLY non-auth-walled platforms + strict full-name HTML verification — zero hallucinations!)
   const permLimit = depthLevel === 1 ? 3 : depthLevel === 2 ? 4 : 5;
   const topPerms = (rankedHandles || []).slice(0, permLimit);
-  if (topPerms.length > 0) {
+  if (topPerms.length > 0 && !isAborted()) {
     const directProbes = [];
     for (const h of topPerms) {
       directProbes.push(
@@ -4530,10 +4568,12 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
     let probeIdx = 0;
     const probeWorker = async () => {
       while (probeIdx < directProbes.length) {
+        if (isAborted()) break;
         const spec = directProbes[probeIdx++];
         if (seenAccountIds.has(normalizeAccountNodeId(spec.platform, spec.handle))) continue;
         try {
           const r = await sovereignFetch(spec.url, { maxBytes: 90_000, jitter: false }, netCtx, 5500);
+          if (isAborted()) break;
           if (!r.ok || r.status !== 200) continue;
           const html = (await r.text()).slice(0, 90_000);
           const low = html.toLowerCase();
@@ -4679,9 +4719,11 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
 
   const runDorkCascade = async (kind, query, filterPlatform = null) => {
     let matchedCount = 0;
+    if (isAborted()) return 0;
 
     // 1. Primary Engine: Startpage over Tor with up to 3 attempts on 3 distinct IsolateSOCKSAuth circuits
-    const spRes = await queryStartpageWithRetry(query, netCtx, nextSocksUser, 15000);
+    const spRes = await queryStartpageWithRetry(query, netCtx, nextSocksUser, 15000, opts);
+    if (isAborted()) return matchedCount;
     if (spRes.strictBlocked) return 0;
     if (spRes.ok) {
       matchedCount += processSearchItems("startpage", kind, spRes.items, filterPlatform);
@@ -4695,12 +4737,14 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
 
     // 2. Fallback Engines only when Startpage failed all 3 circuits for this query
     for (const eng of SEARCH_ENGINES.filter((e) => e.id !== "startpage")) {
+      if (isAborted()) break;
       if (shouldSkipEngine(declinedEngines.get(eng.id))) continue;
       const lastTs = lastEngineHitAt.get(eng.id) || 0;
       const since = Date.now() - lastTs;
       if (since < 350) {
         await new Promise((r) => setTimeout(r, 350 - since));
       }
+      if (isAborted()) break;
       lastEngineHitAt.set(eng.id, Date.now());
       try {
         const url = eng.buildUrl(query);
@@ -4711,7 +4755,9 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
           netCtx,
           reqTimeout
         );
+        if (isAborted()) break;
         let html = r.ok ? await r.text() : "";
+        if (isAborted()) break;
         let challenge = detectSearchChallenge(r, html);
         if (challenge && eng.id === "ddg-lite" && netCtx?.proxyHost) {
           r = await sovereignFetch(
@@ -4720,7 +4766,9 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
             netCtx,
             reqTimeout
           );
+          if (isAborted()) break;
           html = r.ok ? await r.text() : "";
+          if (isAborted()) break;
           challenge = detectSearchChallenge(r, html);
         }
         if (challenge) {
@@ -4771,6 +4819,7 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
     dorkSpecs.push(["contact", `"${fullName}" ("@gmail.com" OR "@proton.me" OR "email" OR "contact")`]);
   }
   for (let i = 0; i < dorkSpecs.length; i += 2) {
+    if (isAborted()) break;
     const pair = dorkSpecs.slice(i, i + 2);
     await Promise.all(pair.map(([k, q]) => runDorkCascade(k, q)));
   }
@@ -4783,7 +4832,9 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
  * - CourtListener (www.courtlistener.com/?q="Full Name") -> real court opinions/dockets
  * - arXiv Author Search (arxiv.org/search/?query=Full+Name&searchtype=author) -> papers + direct PDFs!
  */
-async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
+async function discoverPublicRecords(fullName, netCtx, depthLevel = 2, opts = {}) {
+  const signal = opts && opts.signal ? opts.signal : null;
+  const isAborted = () => Boolean(signal && signal.aborted);
   const records = [];
   const pdfLinks = []; // [{ url, parentRecordUrl, title?, snippet? }]
   const seen = new Set();
@@ -4800,12 +4851,15 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
     // 0. ORCID Academic / Researcher Registry Direct HTML (zero REST API!)
     (async () => {
       try {
+        if (isAborted()) return;
         const orcidUrl = `https://orcid.org/orcid-search/search?searchQuery=${encodeURIComponent(fullName)}`;
         const r = await sovereignFetch(orcidUrl, { maxBytes: 240_000, jitter: false, socksUser: nextPrSocksUser() }, netCtx, 10000);
+        if (isAborted()) return;
         if (!r.ok) return;
         const html = await r.text();
         let count = 0;
         for (const m of html.matchAll(/(\d{4}-\d{4}-\d{4}-\d{3}[\dX])/g)) {
+          if (isAborted()) return;
           const oid = m[1].toUpperCase();
           const idx = m.index || 0;
           const windowTxt = decodeHtmlEntities(html.slice(Math.max(0, idx - 320), idx + 320).replace(/<[^>]+>/g, " "));
@@ -4832,13 +4886,16 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
     // 1. US CourtListener Direct HTML
     (async () => {
       try {
+        if (isAborted()) return;
         const clUrl = `https://www.courtlistener.com/?q=${encodeURIComponent(`"${fullName}"`)}`;
         const r = await sovereignFetch(clUrl, { maxBytes: 260_000, jitter: false }, netCtx, 11000);
+        if (isAborted()) return;
         if (!r.ok) return;
         const html = await r.text();
         const arts = html.match(/<article[^>]*>[\s\S]*?<\/article>/gi) || [];
         let count = 0;
         for (const a of arts) {
+          if (isAborted()) return;
           const linkM = a.match(/<a[^>]+href="(\/(?:opinion|docket)\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/i);
           if (!linkM) continue;
           const title = decodeHtmlEntities(linkM[2].replace(/<[^>]+>/g, " "));
@@ -4866,13 +4923,16 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
     // 2. arXiv Academic Author Search Direct HTML
     (async () => {
       try {
+        if (isAborted()) return;
         const axUrl = `https://arxiv.org/search/?query=${encodeURIComponent(fullName)}&searchtype=author&abstracts=show&order=-announced_date_first&size=25`;
         const r = await sovereignFetch(axUrl, { maxBytes: 220_000, jitter: false }, netCtx, 10000);
+        if (isAborted()) return;
         if (!r.ok) return;
         const html = await r.text();
         const items = html.split(/<li class="arxiv-result">/i).slice(1);
         let count = 0;
         for (const it of items) {
+          if (isAborted()) return;
           const tM = it.match(/<p class="title is-5 mathjax">([\s\S]*?)<\/p>/i);
           const aM = it.match(/<p class="authors">([\s\S]*?)<\/p>/i);
           const pdfM = it.match(/href="(https:\/\/arxiv\.org\/pdf\/[^"]+)"/i);
@@ -4905,6 +4965,7 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
     // 3. IndianKanoon Direct HTML Legal / Court Records
     (async () => {
       try {
+        if (isAborted()) return;
         const ikUrl = `https://indiankanoon.org/search/?formInput=${encodeURIComponent(`"${fullName}"`)}`;
         const r = await sovereignFetch(
           ikUrl,
@@ -4912,11 +4973,13 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
           netCtx,
           12000
         );
+        if (isAborted()) return;
         if (!r.ok) return;
         const html = await r.text();
         const chunks = html.split(/<div\b[^>]*class=["'][^"']*result_title[^"']*["'][^>]*>/i).slice(1);
         let count = 0;
         for (const blk of chunks) {
+          if (isAborted()) return;
           const aM = blk.match(/<a\b[^>]*href=["'](\/(?:doc|docfragment)\/\d+[^"']*)["'][^>]*>([\s\S]*?)<\/a>/i);
           if (!aM) continue;
           const title = decodeHtmlEntities(aM[2].replace(/<[^>]+>/g, " "));
@@ -4945,11 +5008,14 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
 
     // 4. Global Corporate, Directorship, LLP & Registry Filings (Startpage over Tor with 3-circuit retry)
     (async () => {
+      if (isAborted()) return;
       const corpQuery = `"${fullName}" (director OR LLP OR CIN OR DIN OR "Form MGT-7" OR "annual return" OR "founder" OR "managing director" OR "CEO" OR site:falconebiz.com OR site:zaubacorp.com OR site:tofler.in OR site:opencorporates.com OR site:thecompanycheck.com OR site:companieshouse.gov.uk)`;
-      const spRes = await queryStartpageWithRetry(corpQuery, netCtx, nextPrSocksUser, 15000);
+      const spRes = await queryStartpageWithRetry(corpQuery, netCtx, nextPrSocksUser, 15000, opts);
+      if (isAborted()) return;
       if (!spRes.ok) return;
       let count = 0;
       for (const item of spRes.items.slice(0, 10)) {
+        if (isAborted()) return;
         if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
         const fullMatch =
           hasFullNameMatch(`${item.title} ${item.snippet}`, fullName) ||
@@ -4985,11 +5051,14 @@ async function discoverPublicRecords(fullName, netCtx, depthLevel = 2) {
 
     // 5. Global Legal, Regulatory, Patent & Academic/Public Document Discovery (Startpage over Tor)
     (async () => {
+      if (isAborted()) return;
       const docQuery = `"${fullName}" (court OR judgment OR docket OR tribunal OR gazette OR patent OR publication OR thesis OR scribd OR researchgate OR "executive summary" OR filetype:pdf)`;
-      const spRes = await queryStartpageWithRetry(docQuery, netCtx, nextPrSocksUser, 15000);
+      const spRes = await queryStartpageWithRetry(docQuery, netCtx, nextPrSocksUser, 15000, opts);
+      if (isAborted()) return;
       if (!spRes.ok) return;
       let count = 0;
       for (const item of spRes.items.slice(0, 10)) {
+        if (isAborted()) return;
         if (!item.url.startsWith("http") || isBlockedSpaUrl(item.url)) continue;
         const fullMatch =
           hasFullNameMatch(`${item.title} ${item.snippet}`, fullName) ||
@@ -5952,30 +6021,6 @@ function StageBudgetTracker(depthLevel, samples, expectedTotalSec) {
   };
 }
 
-/**
- * Resolve with `promise`'s value, or with a safe fallback after `ms`.
- * Only use for branches whose partial/empty result cannot corrupt the graph.
- */
-function withDeadline(promise, ms, fallbackFactory, label) {
-  const waitMs = Math.max(1, Number(ms) || 1);
-  let timer = null;
-  const deadline = new Promise((resolve) => {
-    timer = setTimeout(() => {
-      let fallback;
-      try {
-        fallback = typeof fallbackFactory === "function" ? fallbackFactory() : fallbackFactory;
-      } catch {
-        fallback = undefined;
-      }
-      resolve(fallback);
-    }, waitMs);
-    if (timer && typeof timer.unref === "function") timer.unref();
-  });
-  return Promise.race([Promise.resolve(promise), deadline]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-}
-
 // ---------------------------------------------------------------------------
 // Full Sovereign V4 Investigation Pipeline (Name-Root, 4-Level Depth + ETA)
 // ---------------------------------------------------------------------------
@@ -6355,34 +6400,53 @@ async function runInvestigation(caseId, input, auth) {
     ...knownDomains.filter((d) => d && !FREE_MAIL_DOMAINS.has(d)),
   ].filter(Boolean);
   let stage0aTruncated = false;
-  const [socialWebRes, pubRecordsRes] = await withDeadline(
-    Promise.all([
-      discoverSocialAndWeb(fullName, netCtx, depthLevel, knownHandles, stage0aContextTerms),
+  let stage0aTruncationMarked = false;
+  const markStage0aTruncated = () => {
+    if (stage0aTruncationMarked) return;
+    stage0aTruncationMarked = true;
+    stage0aTruncated = true;
+    tracker.markTruncated(0, "stage0a:social_web+public_records");
+    logRuntime(`[Investigation ${caseId}] stage0a hit the Wave 1 deadline — continuing with partial discovery`);
+  };
+  // V6: non-destructive Stage 0A cutoff. The deadline aborts the discovery
+  // branches; each branch returns the evidence it already collected instead of
+  // being replaced by an empty fallback array.
+  const stage0aController = new AbortController();
+  let stage0aSeq = 0;
+  const stage0aCircuitPool = new StickyCircuitPool({
+    maxSlots: 2,
+    makeToken: () => `tauf-s0a-${Math.floor(Date.now() / 1000).toString(36)}-${++stage0aSeq}`,
+  });
+  const stage0aOpts = { signal: stage0aController.signal, circuitPool: stage0aCircuitPool };
+  const stage0aTimer = setTimeout(() => {
+    if (stage0aController.signal.aborted) return;
+    markStage0aTruncated();
+    stage0aController.abort();
+  }, Math.max(6000, tracker.remainingWaveMs()));
+  if (stage0aTimer && typeof stage0aTimer.unref === "function") stage0aTimer.unref();
+
+  let socialWebRes = {
+    accounts: [],
+    handles: [],
+    emails: [],
+    phones: [],
+    records: [],
+    websites: [],
+    pdfs: [],
+    engineNotices: [],
+  };
+  let pubRecordsRes = { records: [], pdfLinks: [] };
+  try {
+    [socialWebRes, pubRecordsRes] = await Promise.all([
+      discoverSocialAndWeb(fullName, netCtx, depthLevel, knownHandles, stage0aContextTerms, stage0aOpts),
       depthLevel >= 2
-        ? discoverPublicRecords(fullName, netCtx, depthLevel)
+        ? discoverPublicRecords(fullName, netCtx, depthLevel, stage0aOpts)
         : Promise.resolve({ records: [], pdfLinks: [] }),
-    ]),
-    Math.max(6000, tracker.remainingWaveMs()),
-    () => {
-      stage0aTruncated = true;
-      tracker.markTruncated(0, "stage0a:social_web+public_records");
-      logRuntime(`[Investigation ${caseId}] stage0a hit the Wave 1 deadline — continuing with partial discovery`);
-      return [
-        {
-          accounts: [],
-          handles: [],
-          emails: [],
-          phones: [],
-          records: [],
-          websites: [],
-          pdfs: [],
-          engineNotices: [],
-        },
-        { records: [], pdfLinks: [] },
-      ];
-    },
-    "stage0a"
-  );
+    ]);
+    if (stage0aController.signal.aborted) markStage0aTruncated();
+  } finally {
+    clearTimeout(stage0aTimer);
+  }
   // Sub-stage tick: the two independent discovery branches above are done.
   emitStage(
     "web_social",
@@ -7679,6 +7743,8 @@ async function runInvestigation(caseId, input, auth) {
     }
 
     for (const hit of hits) {
+      // V6: noise-guard drops never enter the graph.
+      if (hit.match_tier === "drop") continue;
       if (hit.match_tier === "collision") wmnCollisions++;
       else wmnCorroborated++;
 
@@ -8943,6 +9009,43 @@ async function runInvestigation(caseId, input, auth) {
         }
 
         const conf = ev.confidence ?? 0.72;
+        const sidecarTier = ev.match_tier || (conf >= 0.8 ? "verified" : "probable");
+        if (sidecarTier === "drop") return;
+        // V6: contradictory / brand-only / zero-signal stranger collisions are
+        // dropped before any node, edge or finding is written. A confirmed
+        // handle pivot (or the operator seed) keeps the existing ceiling.
+        const sidecarSignals = {
+          title: ev.label || "",
+          description: ev.summary || "",
+          siteBrand: platform,
+        };
+        if (evMeta.detectedName) sidecarSignals.detectedName = evMeta.detectedName;
+        if (evMeta.detected_name) sidecarSignals.detectedName = evMeta.detected_name;
+        if (evMeta.org) sidecarSignals.sharedOrg = evMeta.org;
+        if (evMeta.domain) sidecarSignals.sharedDomain = evMeta.domain;
+        if (evMeta.email) sidecarSignals.sharedEmail = evMeta.email;
+        const knownHandlePivot =
+          seedHandleNorm === handle.toLowerCase() ||
+          snap.nodes.some(
+            (n) =>
+              n.kind === "handle" &&
+              String(n.metadata?.handle || "").toLowerCase() === handle.toLowerCase()
+          );
+        if (
+          shouldDropCollision(
+            sidecarSignals,
+            {
+              match_tier: sidecarTier,
+              match_reason: ev.match_reason || `Confirmed via ${ev.tool}`,
+              confidence: conf,
+            },
+            fullName,
+            knownHandlePivot
+          )
+        ) {
+          return;
+        }
+
         const hHubId = normalizeNodeId("handle", handle);
         const hubExists = snap.nodes.some((n) => n.id === hHubId);
         const parentId = hubExists ? hHubId : seedId;
@@ -8959,7 +9062,7 @@ async function runInvestigation(caseId, input, auth) {
             ...evMeta,
             platform,
             handle,
-            match_tier: ev.match_tier || (conf >= 0.8 ? "verified" : "probable"),
+            match_tier: sidecarTier,
             match_reason: ev.match_reason || `Confirmed via ${ev.tool}`,
           },
           url: ev.url || null,
@@ -9117,6 +9220,7 @@ async function runDeepenNode(caseId, nodeId) {
       12
     );
     for (const hit of hits) {
+      if (hit.match_tier === "drop") continue;
       const acctId = normalizeAccountNodeId(hit.site_name, hit.handle);
       addNode({
         id: acctId,
@@ -9154,6 +9258,7 @@ async function runDeepenNode(caseId, nodeId) {
     if (localPart && localPart.length >= 3) {
       const hits = await runWmnForHandle(localPart, snap.input.full_name, [], [], [em], false, netCtx, 12);
       for (const hit of hits) {
+        if (hit.match_tier === "drop") continue;
         const acctId = normalizeAccountNodeId(hit.site_name, hit.handle);
         addNode({
           id: acctId,

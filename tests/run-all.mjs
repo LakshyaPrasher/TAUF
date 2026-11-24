@@ -22,6 +22,9 @@ const SUITES = [
   { id: "onion", label: "Unit / .onion reliability", file: "tests/unit/onion.test.mjs", timeout: 120_000 },
   { id: "eta", label: "Unit / ETA & budget engine", file: "tests/unit/eta.test.mjs", timeout: 120_000 },
   { id: "search", label: "Unit / search cascade reliability", file: "tests/unit/search.test.mjs", timeout: 120_000 },
+  { id: "noise", label: "Unit / noise filtering", file: "tests/unit/noise.test.mjs", timeout: 120_000 },
+  { id: "search_pool", label: "Unit / search pool", file: "tests/unit/search_pool.test.mjs", timeout: 120_000 },
+  { id: "scheduler", label: "Unit / task scheduler", file: "tests/unit/scheduler.test.mjs", timeout: 120_000 },
   { id: "server", label: "Server / API integration", file: "tests/server/api.test.mjs", timeout: 180_000 },
   {
     id: "integration",
