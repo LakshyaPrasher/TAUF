@@ -250,6 +250,10 @@ export interface ClassifiedIntel {
   nodeToTab: Map<string, IntelTab>;
 }
 
+function isExcludedStatus(status: GraphNode["status"] | undefined): boolean {
+  return status === "dismissed" || status === "quarantined";
+}
+
 function isRealEmailNode(node: GraphNode): boolean {
   const kind = node.kind.toLowerCase();
   const idLower = node.id.toLowerCase();
@@ -769,7 +773,7 @@ export function classifyIntel(
   const serviceCountByAnchor = new Map<string, number>();
 
   for (const node of nodes) {
-    if (node.status === "dismissed") continue;
+    if (isExcludedStatus(node.status)) continue;
     if (!isServiceRegistrationNode(node)) continue;
 
     const rawName =
@@ -819,7 +823,7 @@ export function classifyIntel(
       });
     if (!isHoleheIgnorant) continue;
     const linked = nodeById.get(f.node_id);
-    if (linked?.status === "dismissed") continue;
+    if (isExcludedStatus(linked?.status)) continue;
     if (linked && isServiceRegistrationNode(linked)) continue;
 
     const rawName = cleanServiceName(
@@ -850,7 +854,7 @@ export function classifyIntel(
   const phoneMap = new Map<string, PhoneRecord>();
 
   for (const node of nodes) {
-    if (node.status === "dismissed") continue;
+    if (isExcludedStatus(node.status)) continue;
 
     if (isRealEmailNode(node)) {
       const emailAddr = node.label.trim();
@@ -980,7 +984,7 @@ export function classifyIntel(
 
     const explicitTier = node.metadata?.match_tier?.toLowerCase();
     let tier: "verified" | "probable" | "collision";
-    if (node.status === "dismissed" || explicitTier === "collision") {
+    if (isExcludedStatus(node.status) || explicitTier === "collision") {
       tier = "collision";
     } else if (
       node.status === "confirmed" ||
@@ -1078,7 +1082,7 @@ export function classifyIntel(
   const accounts: AccountRecord[] = [];
   const collisionAccounts: AccountRecord[] = [];
   for (const rec of accountMap.values()) {
-    if (rec.tier === "collision" || rec.status === "dismissed") {
+    if (rec.tier === "collision" || isExcludedStatus(rec.status)) {
       collisionAccounts.push(rec);
     } else {
       accounts.push(rec);
@@ -1090,7 +1094,7 @@ export function classifyIntel(
   // 4. Legal / Corporate / Academic Public Records (Records tab)
   const recordMap = new Map<string, PublicRecordItem>();
   for (const node of nodes) {
-    if (node.status === "dismissed") continue;
+    if (isExcludedStatus(node.status)) continue;
     if (!isPublicRecordNode(node)) continue;
 
     const key = (node.url || node.id).toLowerCase();
@@ -1120,7 +1124,7 @@ export function classifyIntel(
   // 5. Domains, DNS & TLS (Records tab)
   const domainMap = new Map<string, DomainInfraRecord>();
   for (const node of nodes) {
-    if (node.status === "dismissed") continue;
+    if (isExcludedStatus(node.status)) continue;
     if (!isDomainOrCertNode(node)) continue;
 
     const domain = (node.metadata?.domain || node.label)
@@ -1183,7 +1187,7 @@ export function classifyIntel(
   // 6. Public Documents / PDFs (Records tab)
   const docMap = new Map<string, DocumentRecord>();
   for (const node of nodes) {
-    if (node.status === "dismissed") continue;
+    if (isExcludedStatus(node.status)) continue;
     if (!isDocumentNode(node)) continue;
 
     const filename = (node.metadata?.filename || node.label).trim();
@@ -1232,7 +1236,7 @@ export function classifyIntel(
   const cryptoMap = new Map<string, CryptoKeyRecord>();
 
   for (const node of nodes) {
-    if (node.status === "dismissed") continue;
+    if (isExcludedStatus(node.status)) continue;
 
     if (isOnionNode(node)) {
       const host = node.metadata?.onion_host || extractDomainFromUrl(node.url);
@@ -1414,7 +1418,7 @@ export function classifyIntel(
 
   for (const f of findings) {
     const linked = nodeById.get(f.node_id);
-    if (linked?.status === "dismissed") continue;
+    if (isExcludedStatus(linked?.status)) continue;
     if (f.category === "darkweb" && !nodeToTab.has(f.node_id)) {
       const host = linked?.metadata?.onion_host || extractDomainFromUrl(f.url);
       const key = (f.url || host || f.id).toLowerCase();

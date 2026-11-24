@@ -131,7 +131,9 @@ function classifyVisualDimension(node: GraphNode): VisualDimension {
 
 function isCollisionNode(node: GraphNode): boolean {
   if (node.layer === "seed" || node.status === "confirmed") return false;
-  if (node.metadata?.match_tier === "collision") return true;
+  if (node.status === "quarantined" || node.metadata?.match_tier === "collision") {
+    return true;
+  }
   return node.confidence < 0.52;
 }
 
@@ -490,7 +492,7 @@ export function IdentityGraph({
           },
         },
         {
-          selector: "node[status = 'dismissed']",
+          selector: "node[status = 'dismissed'], node[status = 'quarantined']",
           style: {
             "border-style": "dashed",
             opacity: 0.3,

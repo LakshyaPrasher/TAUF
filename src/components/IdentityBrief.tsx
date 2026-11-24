@@ -332,7 +332,8 @@ export function IdentityBrief({
                   : "Deepen"}
               </span>
             </button>
-            {selectedNode.status === "unverified" && (
+            {(selectedNode.status === "unverified" ||
+              selectedNode.status === "quarantined") && (
               <button
                 type="button"
                 className="btn-ghost-xs"
@@ -342,7 +343,8 @@ export function IdentityBrief({
                 <span>Confirm</span>
               </button>
             )}
-            {selectedNode.status !== "dismissed" ? (
+            {selectedNode.status !== "dismissed" &&
+            selectedNode.status !== "quarantined" ? (
               <button
                 type="button"
                 className="btn-ghost-xs"

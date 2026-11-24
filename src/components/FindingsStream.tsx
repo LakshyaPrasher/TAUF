@@ -104,7 +104,8 @@ export function FindingsStream({
   const renderAccountCard = (acc: AccountRecord, isCollision = false) => {
     const isSelected = selectedNodeId === acc.nodeId;
     const isExpanded = expandedAccountKey === acc.key || isSelected;
-    const isDismissed = acc.status === "dismissed";
+    const isDismissed =
+      acc.status === "dismissed" || acc.status === "quarantined";
 
     const metaBits: string[] = [];
     if (acc.location) metaBits.push(redactText(acc.location, redact));
@@ -217,7 +218,7 @@ export function FindingsStream({
                   {deepeningNodeId === acc.nodeId ? "Deepening..." : "Deepen"}
                 </span>
               </button>
-              {acc.status === "unverified" && (
+              {(acc.status === "unverified" || acc.status === "quarantined") && (
                 <button
                   type="button"
                   className="btn-ghost-xs"
@@ -227,7 +228,7 @@ export function FindingsStream({
                   <span>Confirm</span>
                 </button>
               )}
-              {acc.status !== "dismissed" ? (
+              {acc.status !== "dismissed" && acc.status !== "quarantined" ? (
                 <button
                   type="button"
                   className="btn-ghost-xs"
@@ -255,7 +256,8 @@ export function FindingsStream({
 
   const renderOnionCard = (hit: OnionRecord, isBroad = false) => {
     const isSelected = selectedNodeId === hit.nodeId;
-    const isDismissed = hit.status === "dismissed";
+    const isDismissed =
+      hit.status === "dismissed" || hit.status === "quarantined";
     const extraSensitive = hit.onionHost ? [hit.onionHost] : [];
     const rawLoc =
       hit.whereFound ||
@@ -392,7 +394,7 @@ export function FindingsStream({
                   <span>Confirm</span>
                 </button>
               )}
-              {hit.status !== "dismissed" ? (
+              {hit.status !== "dismissed" && hit.status !== "quarantined" ? (
                 <button
                   type="button"
                   className="btn-ghost-xs"

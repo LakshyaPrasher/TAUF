@@ -1,0 +1,152 @@
+{
+  "generated_at": "2026-11-24T06:26:41.190Z",
+  "root": "C:\\Users\\laksh\\.gemini\\antigravity\\scratch\\TAUF",
+  "node": {
+    "version": "v24.22.1",
+    "exe": "C:\\Users\\laksh\\AppData\\Local\\OpenAI\\Codex\\runtimes\\cua_node\\76f5b5935a63c7ba\\bin\\node.exe"
+  },
+  "platform": "win32/x64",
+  "python": {
+    "used": "C:\\Users\\laksh\\.local\\bin\\python3.12.exe",
+    "label": "C:\\Users\\laksh\\.local\\bin\\python3.12.exe",
+    "venv_usable": false,
+    "venv_error": "blocked by Application Control (os error 4551)",
+    "fallback": true
+  },
+  "counts": {
+    "PASS": 13,
+    "FAIL": 1,
+    "WARN": 2,
+    "SKIP": 0
+  },
+  "checks": [
+    {
+      "id": "A1",
+      "title": "node --check local-server.mjs",
+      "status": "PASS",
+      "detail": "exit=0 · 60ms",
+      "ms": 60,
+      "exit": 0
+    },
+    {
+      "id": "A2",
+      "title": "python -m py_compile sidecar/bridge.py (fallback python)",
+      "status": "PASS",
+      "detail": "exit=0 · 95ms  [venv blocked: blocked by Application Control (os error 4551)]",
+      "ms": 95,
+      "exit": 0
+    },
+    {
+      "id": "A3",
+      "title": "forbidden external OSINT API audit (33 files scanned)",
+      "status": "PASS",
+      "detail": "0 hits across src, src-tauri/src, local-server.mjs, sidecar/bridge.py, src-tauri/resources/wmn_curated.json for 26 forbidden tokens",
+      "ms": null,
+      "exit": null
+    },
+    {
+      "id": "A4",
+      "title": "hardcoded user-path audit (C:\\Users\\, /home/, laksh)",
+      "status": "PASS",
+      "detail": "0 non-comment hits in 40 app files (patterns: C:\\Users\\, /home/, laksh)\nexcluded 4 comment/detector line(s):\n        src/components/ConfigToolsModal.tsx:184  [C:\\Users\\]  classify=ui-placeholder  placeholder=\"C:\\Users\\analyst\\authorized-corpus\"\n        src-tauri/src/engine/doc_meta.rs:198  [C:\\Users\\]  classify=comment  /// internal OS paths (`C:\\Users\\...`, `/Users/...`, `/home/...`), and embedded emails.\n        src-tauri/src/engine/doc_meta.rs:198  [/home/]  classify=comment  …C:\\Users\\...`, `/Users/...`, `/home/...`), and embedded emails.\n        src-tauri/src/engine/doc_meta.rs:260  [/home/]  classify=detector-regex  …Za-z]:[\\\\/]Users[\\\\/]|/Users/|/home/)([A-Za-z0-9._\\-]{2,40})(?:[\\\\/]|$)\",",
+      "ms": null,
+      "exit": null
+    },
+    {
+      "id": "A5",
+      "title": "audit-fix presence (SOCKS reply framing, accuracy, collision, redaction, corpus, onion base)",
+      "status": "PASS",
+      "detail": "all 14 markers present:\n        local-server.mjs: replyBuf (23x)\n        local-server.mjs: nameEvidence (14x)\n        local-server.mjs: quarantined (36x)\n        local-server.mjs: redactProxyUrl (5x)\n        local-server.mjs: isUnsafeCorpusRoot (3x)\n        local-server.mjs: getConfiguredOnionBase (3x)\n        local-server.mjs: scanLocalCorpus (3x)\n        local-server.mjs: createReadStream (2x)\n        local-server.mjs: readline (3x)\n        local-server.mjs: fsyncSync (1x)\n        sidecar/bridge.py: as_completed (2x)\n        sidecar/bridge.py: sidecar_budget_ms (5x)\n        sidecar/bridge.py: to_httpx_socks5 preserves socks5h:// (remote DNS)\n        local-server.mjs: scanLocalCorpus streams via createReadStream + readline",
+      "ms": null,
+      "exit": null
+    },
+    {
+      "id": "A6",
+      "title": "UI untouched (git status --short -- src src-tauri/src)",
+      "status": "FAIL",
+      "detail": "unexpected changes:\n        M src/App.tsx\n         M src/components/FindingsStream.tsx\n         M src/components/IdentityBrief.tsx\n         M src/components/IdentityGraph.tsx\n         M src/lib/classify.ts\n         M src/types.ts",
+      "ms": 52,
+      "exit": 0
+    },
+    {
+      "id": "B7",
+      "title": "bridge.py --probe → 7 tools",
+      "status": "WARN",
+      "detail": "exit=0 · 121ms\nexactly 7 tools: maigret, sherlock, socid-extractor, holehe, ignorant, h8mail, onionsearch\n7/7 report installed=true (maigret, sherlock, socid-extractor, holehe, ignorant, h8mail, onionsearch)\nmodules importable by C:\\Users\\laksh\\.local\\bin\\python3.12.exe: 0/7\nWARN (environment): sidecar/.venv python is blocked by Windows Application Control (os error 4551).\n  Probed with the fallback interpreter. `installed=true` comes from bridge.py prepending\n  sidecar/.venv/Scripts to PATH (CLI .exe shims exist), but the 7 modules are NOT importable\n  by the fallback interpreter → tool execution cannot be verified in this environment.\n  Re-run with a usable venv to convert this to PASS/FAIL.",
+      "ms": 121,
+      "exit": 0
+    },
+    {
+      "id": "B8",
+      "title": "malformed payload safety: --run --payload '[\"x\"]'",
+      "status": "PASS",
+      "detail": "exit=0 · 114ms\n        {\"kind\": \"tool_status\", \"tool\": \"maigret\", \"state\": \"skipped\", \"hits\": 0, \"detail\": \"needs handle\"}\n        {\"kind\": \"tool_status\", \"tool\": \"ignorant\", \"state\": \"skipped\", \"hits\": 0, \"detail\": \"needs phone\"}\n        {\"kind\": \"tool_status\", \"tool\": \"holehe\", \"state\": \"skipped\", \"hits\": 0, \"detail\": \"needs email\"}\n        {\"kind\": \"tool_status\", \"tool\": \"socid-extractor\", \"state\": \"skipped\", \"hits\": 0, \"detail\": \"0 confirmed URLs\"}\n        {\"kind\": \"tool_status\", \"tool\": \"onionsearch\", \"state\": \"skipped\", \"hits\": 0, \"detail\": \"Tor toggle OFF\"}\n        {\"kind\": \"tool_status\", \"tool\": \"sherlock\", \"state\": \"skipped\", \"hits\": 0, \"detail\": \"needs handle\"}\n        {\"kind\": \"tool_status\", \"tool\": \"h8mail\", \"state\": \"skipped\", \"hits\": 0, \"detail\": \"needs email\"}\n",
+      "ms": 114,
+      "exit": 0
+    },
+    {
+      "id": "B9",
+      "title": "string payload --payload '{\"handles\":\"alice\"}' must be ONE handle",
+      "status": "PASS",
+      "detail": "exit=0 · 197ms\nobserved handle mentions: @alice\ntool details:\n        Deep profile check for @alice\n        Checking @alice across 26 sites\n        0 profile hit(s) across 1 handle(s)\n        0 profile hit(s) across 1 handle(s)",
+      "ms": 197,
+      "exit": 0
+    },
+    {
+      "id": "C10",
+      "title": "node scripts/verify-portable.mjs",
+      "status": "PASS",
+      "detail": "exit=0 · 406ms\n        REQUIRED: 15/15 passed, 0 failed\n        OPTIONAL: 5/7 clean, 2 warning(s)\n        VERDICT: PORTABLE FOLDER OK — TAUF can launch from this folder.\nWARN rows:\n        WARN sidecar --probe exit null: spawnSync C:\\Users\\laksh\\.gemini\\antigravity\\scratch\\TAUF\\sidecar\\.venv\\Scripts\\python.exe UNKNOWN\n        WARN Tor binary EXTERNAL-RUNTIME PATH-NOT-BUNDLED C:\\Users\\laksh\\AppData\\Local\\TAUF\\tor\\tor\\tor.exe",
+      "ms": 406,
+      "exit": 0
+    },
+    {
+      "id": "C11",
+      "title": "node scripts/package-portable.mjs --help",
+      "status": "PASS",
+      "detail": "exit=0 · 60ms · usage text present, --dry-run documented",
+      "ms": 60,
+      "exit": 0
+    },
+    {
+      "id": "C12",
+      "title": "node scripts/package-portable.mjs --dry-run",
+      "status": "PASS",
+      "detail": "exit=0 · 525ms\nmanifest: TOTAL 14711 201 MB 16 top-level item(s), 0.5s\nDRY RUN complete - 14711 files, 201 MB would be written to C:\\Users\\laksh\\.gemini\\antigravity\\scratch\\TAUF-portable",
+      "ms": 525,
+      "exit": 0
+    },
+    {
+      "id": "C13",
+      "title": "node --check scripts/{verify-portable,package-portable}.mjs",
+      "status": "PASS",
+      "detail": "verify-portable.mjs: exit=0 · 60ms\npackage-portable.mjs: exit=0 · 58ms",
+      "ms": null,
+      "exit": null
+    },
+    {
+      "id": "D14",
+      "title": "tsc --noEmit (strict typecheck)",
+      "status": "PASS",
+      "detail": "exit=0 · 1428ms · 0 type errors",
+      "ms": 1428,
+      "exit": 0
+    },
+    {
+      "id": "D15",
+      "title": "vite build (production)",
+      "status": "PASS",
+      "detail": "exit=0 · 3655ms\n\u001b[32m✓\u001b[39m 1590 modules transformed.\n\u001b[32m✓ built in 3.14s\u001b[39m\ndist/index.html mtime: 2026-11-24T06:26:40.752Z",
+      "ms": 3655,
+      "exit": 0
+    },
+    {
+      "id": "D16",
+      "title": "rustfmt --edition 2021 --check (6 files)",
+      "status": "WARN",
+      "detail": "rustfmt unavailable — skipped (environment):\n        error: command failed: 'rustfmt': An Application Control policy has blocked this file. (os error 4551)\n\ncargo: cargo 1.100.0 (3acc79c0c 2026-11-05)\nRust formatting is NOT verified by this run.",
+      "ms": 330,
+      "exit": 1
+    }
+  ]
+}

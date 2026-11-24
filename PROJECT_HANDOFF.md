@@ -332,7 +332,7 @@ wscript.exe .\launch-tauf.vbs
 
 # 5. Inspect live runtime health & gracefully shut down
 Invoke-RestMethod -Uri "http://127.0.0.1:1420/__tauf_health__"
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:1420/__tauf_shutdown__"
+Invoke-RestMethod -Method Post -Headers @{"X-TAUF-Launcher"="1"} -Uri "http://127.0.0.1:1420/__tauf_shutdown__"
 ```
 
 ### 8.2 Building Native `tauf.exe` Once `cargo.exe` Is Whitelisted
@@ -378,3 +378,25 @@ Once `src-tauri\target\release\tauf.exe` exists, `launch-tauf.cmd` automatically
 ### 9.3 Remaining Polish for Next Session Pickup
 1. Filter placeholder domains like `domain.com` observed on earlier trace (`PLATFORM_NOISE_DOMAINS`).
 2. Run V5.2 live full-window visual QA (`qa-visual` screenshots of updated Records, PDFs, and Hierarchy Graph) and purge the 2 retained V5.2 QA inspection cases (`9e9e4c69`, `2dbf755a`) if desired.
+
+---
+
+## 10. Portable Packaging (`scripts/verify-portable.mjs` · `scripts/package-portable.mjs`)
+
+The repo is already a single working folder: app code, `dist/`, `public/`, `sidecar/` (+ `.venv` with 7/7 tools), `src-tauri/resources/wmn_curated.json`, launchers and `node_modules/` all live inside `<REPO_ROOT>`. The only truly external dependency is the **Node.js runtime** (>= 18, discovered via `TAUF_NODE_EXE` / PATH / NVM / Volta / Scoop / fnm). **Tor** and the **runtime vault/config** stay outside on purpose:
+
+- Tor: `%LOCALAPPDATA%\TAUF\tor\tor\tor.exe` today (PATH-NOT-BUNDLED); drop the Tor Expert Bundle at `<repo>\tor\tor\tor.exe` and `detectTorBinary()` picks it up as BUNDLED.
+- Runtime data: `%LOCALAPPDATA%\TAUF\{cases.json,config.json,runtime.log,corpus,tor-data,*-app-profile}` (`~/.tauf` on macOS/Linux) is per-machine and must never be shipped.
+
+```powershell
+node scripts/verify-portable.mjs          # REQUIRED vs OPTIONAL report; exit 1 on REQUIRED failures
+node scripts/verify-portable.mjs --json   # machine-readable
+node scripts/package-portable.mjs --help  # flags: --out, --with-node-modules, --with-reports, --force, --dry-run
+node scripts/package-portable.mjs --dry-run
+node scripts/package-portable.mjs --out D:\TAUF
+```
+
+`package-portable.mjs` assembles one distributable folder (default `<repo parent>\TAUF-portable`), excluding `.git`, `node_modules`/`reports` (opt-in), `__pycache__`, `*.log`, `src-tauri/target` and test output; it refuses to overwrite a non-empty target unless `--force` (and only targets carrying its own `PORTABLE-MANIFEST.txt`), never writes to `%LOCALAPPDATA%`, materialises only in-repo symlinks, then runs `node --check` on the copied `local-server.mjs` + `scripts/*.mjs`. Reference dry-run: **14,711 files / 201 MB** (`sidecar` 198 MB, `dist` 1.2 MB); adding `--with-node-modules` brings it to ~294 MB.
+
+Latest verifier run: `15/15 REQUIRED passed, 6/7 optional clean, 1 warning (Tor PATH-NOT-BUNDLED)` -> exit 0. Full component table and Tor/system-only notes: `reports/PACKAGING.md`.
+

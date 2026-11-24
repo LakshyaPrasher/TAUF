@@ -1,6 +1,6 @@
 export type NodeLayer = "seed" | "anchor" | "surface" | "deep" | "darkweb";
 
-export type NodeStatus = "confirmed" | "dismissed" | "unverified";
+export type NodeStatus = "confirmed" | "dismissed" | "quarantined" | "unverified";
 
 export type MatchTier = "verified" | "probable" | "collision";
 

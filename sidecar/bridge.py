@@ -24,7 +24,7 @@ Verified V5 Tor/Proxy Behavior:
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import importlib.util
 import json
@@ -41,6 +41,8 @@ from urllib.parse import urlparse
 
 ACTIVE_ADJACENT_TOOLS = {"holehe", "ignorant"}
 _EMIT_LOCK = threading.Lock()
+_TERMINAL_TOOL_STATES = {"done", "skipped", "error"}
+_TERMINAL_EMITTED: set[str] = set()
 
 # Prepend sidecar/.venv/Scripts (or bin) to PATH so installed venv tools are always discoverable
 _SIDECAR_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -163,6 +165,12 @@ TOOL_CATALOG = [
 
 def emit(event: dict[str, Any]) -> None:
     with _EMIT_LOCK:
+        if (
+            event.get("kind") == "tool_status"
+            and event.get("tool")
+            and event.get("state") in _TERMINAL_TOOL_STATES
+        ):
+            _TERMINAL_EMITTED.add(str(event["tool"]))
         sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
@@ -179,23 +187,30 @@ def ensure_socks5h(raw: str | None) -> str | None:
 
 
 def to_httpx_socks5(raw: str | None) -> str | None:
-    """httpx + socksio expects `socks5://host:port` (resolves DNS via proxy automatically)."""
+    """Keep `socks5h://` so the SOCKS proxy resolves DNS remotely (no local DNS leak)."""
     if not raw or not raw.strip():
         return None
     s = raw.strip()
     if s.startswith("socks5h://"):
-        return "socks5://" + s[len("socks5h://") :]
+        return s
+    if s.startswith("socks5://"):
+        return "socks5h://" + s[len("socks5://") :]
     return s
 
 
-def is_tool_installed(spec: dict[str, Any]) -> bool:
+def is_importable(spec: dict[str, Any]) -> bool:
     mod = spec.get("module")
-    if mod and "-" not in mod:
-        try:
-            if importlib.util.find_spec(mod) is not None:
-                return True
-        except Exception:
-            pass
+    if not mod or "-" in mod:
+        return False
+    try:
+        return importlib.util.find_spec(mod) is not None
+    except Exception:
+        return False
+
+
+def is_tool_installed(spec: dict[str, Any]) -> bool:
+    if is_importable(spec):
+        return True
     for binary in spec["cli"]:
         if shutil.which(binary):
             return True
@@ -207,6 +222,9 @@ def probe_tools() -> list[dict[str, Any]]:
         {
             "name": spec["name"],
             "installed": is_tool_installed(spec),
+            # Honest sub-signal: a PATH shim can exist while the module is not
+            # importable in the running interpreter (venv/App-Control mismatch).
+            "importable": is_importable(spec),
             "category": spec["category"],
             "mode": spec["mode"],
             "install_hint": spec["install_hint"],
@@ -310,11 +328,21 @@ def stream_python_code(
     return rc, lines
 
 
-def run_holehe_direct(email: str, active_proxy: str | None, depth_level: int = 2) -> list[dict[str, Any]]:
+def run_holehe_direct(
+    email: str,
+    active_proxy: str | None,
+    depth_level: int = 2,
+    timeout_ms: int | None = None,
+) -> list[dict[str, Any]]:
     """Run Holehe modules directly via Trio + httpx (socksio) with CapacityLimiter(18) so Tor circuits aren't choked."""
     httpx_proxy = to_httpx_socks5(active_proxy)
-    trio_timeout = {2: 30, 3: 38, 4: 44}.get(depth_level, 30)
-    subproc_timeout = trio_timeout + 8
+    if timeout_ms:
+        subproc_timeout = max(6, int(timeout_ms) // 1000)
+        # Leave headroom inside the outer subprocess cap for trio shutdown.
+        trio_timeout = max(5, subproc_timeout - 4)
+    else:
+        trio_timeout = {2: 30, 3: 38, 4: 44}.get(depth_level, 30)
+        subproc_timeout = trio_timeout + 8
     code = f"""
 import json, trio, httpx
 from holehe.core import import_submodules, get_functions, launch_module
@@ -421,37 +449,63 @@ def parse_maigret_lines(lines: list[str]) -> list[dict[str, Any]]:
     return results
 
 
+def _str_list(value: Any) -> list[str]:
+    """Accept a single string or a list of strings; never iterate a string char-by-char."""
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str) and v.strip()]
+    return []
+
+
 def run_sidecar(payload: dict[str, Any]) -> None:
-    passive_only: bool = bool(payload.get("passive_only", False))
-    enable_tor: bool = bool(payload.get("enable_tor", False))
-    strict_anonymity: bool = bool(payload.get("strict_anonymity", False))
-    depth_level: int = max(1, min(4, int(payload.get("depth_level") or 2)))
+    # SC-6: a malformed/non-object payload must not crash the bridge with a traceback.
+    if not isinstance(payload, dict):
+        emit(
+            {
+                "kind": "tool_status",
+                "tool": "payload",
+                "state": "error",
+                "hits": 0,
+                "detail": "payload must be a JSON object",
+            }
+        )
+        return
+    passive_only: bool = payload.get("passive_only") is True
+    enable_tor: bool = payload.get("enable_tor") is True
+    strict_anonymity: bool = payload.get("strict_anonymity") is True
+    try:
+        depth_level = max(1, min(4, int(payload.get("depth_level") or 2)))
+    except (TypeError, ValueError):
+        depth_level = 2
     full_name: str = str(payload.get("full_name") or "").strip()
     handles: list[str] = [
-        h.strip().lstrip("@")
-        for h in (payload.get("handles") or [])
-        if isinstance(h, str) and h.strip()
+        h.strip().lstrip("@") for h in _str_list(payload.get("handles")) if h.strip()
     ]
     emails: list[str] = [
-        e.strip().lower()
-        for e in (payload.get("emails") or [])
-        if isinstance(e, str) and "@" in e
+        e.strip().lower() for e in _str_list(payload.get("emails")) if "@" in e
     ]
     profile_urls: list[str] = [
         u.strip()
-        for u in (payload.get("profile_urls") or [])
-        if isinstance(u, str) and u.strip().startswith("http")
+        for u in _str_list(payload.get("profile_urls"))
+        if u.strip().startswith("http")
     ]
     phones: list[str] = [
         p.strip()
-        for p in (payload.get("phones") or ([payload.get("phone")] if payload.get("phone") else []))
-        if isinstance(p, str) and p.strip()
+        for p in (_str_list(payload.get("phones")) or _str_list(payload.get("phone")))
+        if p.strip()
     ]
     phone: str = phones[0] if phones else ""
     local_corpus_dir: str = str(payload.get("local_corpus_dir") or "").strip()
     tor_socks_url = ensure_socks5h(payload.get("tor_socks_url"))
     proxy_url = ensure_socks5h(payload.get("proxy_url"))
     active_proxy = tor_socks_url if (enable_tor or strict_anonymity) and tor_socks_url else proxy_url
+    # SC-8: the Node side kills this process at `sidecar_budget_ms`; keep the
+    # internal per-email budgets strictly inside that cap.
+    try:
+        sidecar_budget_ms = int(payload.get("sidecar_budget_ms") or 75_000)
+    except (TypeError, ValueError):
+        sidecar_budget_ms = 75_000
 
     unique_handles: list[str] = []
     seen_handles_low: set[str] = set()
@@ -470,6 +524,8 @@ def run_sidecar(payload: dict[str, Any]) -> None:
         for spec in TOOL_CATALOG:
             if is_tool_installed(spec):
                 emit({"kind": "tool_status", "tool": spec["name"], "state": "skipped", "hits": 0, "detail": "Quick depth (L1)"})
+            else:
+                emit({"kind": "tool_status", "tool": spec["name"], "state": "skipped", "hits": 0, "detail": "not installed"})
         return
 
     maigret_top = {2: "25", 3: "60", 4: "100"}.get(depth_level, "25")
@@ -489,6 +545,7 @@ def run_sidecar(payload: dict[str, Any]) -> None:
             return
 
         if not installed:
+            emit({"kind": "tool_status", "tool": name, "state": "skipped", "hits": 0, "detail": "not installed"})
             return
 
         # -----------------------------------------------------------------
@@ -565,11 +622,18 @@ def run_sidecar(payload: dict[str, Any]) -> None:
                 emit({"kind": "tool_status", "tool": name, "state": "skipped", "hits": 0, "detail": "needs email"})
                 return
             target_emails = emails[:holehe_email_limit]
+            depth_email_cap = {2: 38_000, 3: 46_000, 4: 52_000}.get(depth_level, 38_000)
+            per_email_ms = max(
+                18_000,
+                min(depth_email_cap, (sidecar_budget_ms - 5_000) // max(1, len(target_emails))),
+            )
             emit({"kind": "tool_status", "tool": name, "state": "running", "hits": 0, "detail": f"Checking {len(target_emails)} email(s){proxy_label}"})
             seen_doms = set()
             emitted = 0
-            for em in target_emails:
-                found_hits = run_holehe_direct(em, active_proxy, depth_level=depth_level)
+            for checked_idx, em in enumerate(target_emails, start=1):
+                found_hits = run_holehe_direct(
+                    em, active_proxy, depth_level=depth_level, timeout_ms=per_email_ms
+                )
                 for item in found_hits:
                     dom = str(item.get("domain") or item.get("name") or "").strip()
                     key = f"{dom}:{em}"
@@ -601,6 +665,18 @@ def run_sidecar(payload: dict[str, Any]) -> None:
                                 **({"phone_hint": str(item["phoneNumber"])} if item.get("phoneNumber") else {}),
                             },
                             "summary": f"Holehe confirmed {em} is registered on {dom}{extra_txt}.",
+                        }
+                    )
+                # SC-8: surface per-email partial progress so a later timeout still
+                # leaves the analyst with the hits already found.
+                if len(target_emails) > 1 and checked_idx < len(target_emails):
+                    emit(
+                        {
+                            "kind": "tool_status",
+                            "tool": name,
+                            "state": "running",
+                            "hits": emitted,
+                            "detail": f"{emitted} service(s) so far — checked {checked_idx}/{len(target_emails)} email(s){proxy_label}",
                         }
                     )
             emit(
@@ -950,32 +1026,45 @@ def run_sidecar(payload: dict[str, Any]) -> None:
             code = f"""
 import sys
 sys.argv = {json.dumps(argv)}
-import onionsearch.core as oc
-oc.ENGINES["ahmia"] = {json.dumps(LIVE_AHMIA_V3)}
-oc.ENGINES["onionland"] = {json.dumps(LIVE_ONIONLAND_V3)}
-oc.scrape()
+try:
+    import onionsearch.core as oc
+    oc.ENGINES["ahmia"] = {json.dumps(LIVE_AHMIA_V3)}
+    oc.ENGINES["onionland"] = {json.dumps(LIVE_ONIONLAND_V3)}
+    oc.scrape()
+except Exception as exc:
+    print("TAUF_ONIONSEARCH_ERROR:" + repr(exc)[:300])
+    raise SystemExit(3)
 """
-            rc, lines = stream_python_code(code, build_clean_env(None), timeout=26)
+            # SC-5: onionsearch needs ~45 s to write its CSV over a cold circuit.
+            rc, lines = stream_python_code(code, build_clean_env(None), timeout=45)
+            patch_error = ""
+            for ln in reversed(lines):
+                if ln.startswith("TAUF_ONIONSEARCH_ERROR:"):
+                    patch_error = ln[len("TAUF_ONIONSEARCH_ERROR:") :].strip()
+                    break
             found_onions: list[tuple[str, str]] = []
             seen_o = set()
-            if os.path.exists(tmp_csv):
+            try:
+                if os.path.exists(tmp_csv):
+                    try:
+                        with open(tmp_csv, "r", encoding="utf-8", errors="ignore") as f:
+                            for row in csv.reader(f):
+                                if len(row) >= 3 and ".onion" in row[2]:
+                                    title = row[1].strip() or "Tor Hidden Service"
+                                    url = row[2].strip()
+                                    if (
+                                        url not in seen_o
+                                        and "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd" not in url
+                                        and "3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad" not in url
+                                    ):
+                                        seen_o.add(url)
+                                        found_onions.append((title, url))
+                    except Exception:
+                        pass
+            finally:
                 try:
-                    with open(tmp_csv, "r", encoding="utf-8", errors="ignore") as f:
-                        for row in csv.reader(f):
-                            if len(row) >= 3 and ".onion" in row[2]:
-                                title = row[1].strip() or "Tor Hidden Service"
-                                url = row[2].strip()
-                                if (
-                                    url not in seen_o
-                                    and "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd" not in url
-                                    and "3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad" not in url
-                                ):
-                                    seen_o.add(url)
-                                    found_onions.append((title, url))
-                except Exception:
-                    pass
-                try:
-                    os.remove(tmp_csv)
+                    if os.path.exists(tmp_csv):
+                        os.remove(tmp_csv)
                 except Exception:
                     pass
             for title, o in found_onions[:8]:
@@ -998,10 +1087,66 @@ oc.scrape()
                         "summary": f"OnionSearch over Tor SOCKS5h returned '{title}' at {o}.",
                     }
                 )
+            # SC-5: never report a killed/failed crawl as a clean 0-hit run.
+            if rc != 0:
+                tail = " | ".join(strip_ansi(ln).strip() for ln in lines[-3:] if ln.strip())
+                if patch_error:
+                    detail = f"onionsearch monkey-patch/scrape failed: {patch_error}"
+                else:
+                    detail = f"onionsearch rc={rc}: {tail or 'no output'}"
+                emit(
+                    {
+                        "kind": "tool_status",
+                        "tool": name,
+                        "state": "error",
+                        "hits": len(found_onions[:8]),
+                        "detail": detail[:400],
+                    }
+                )
+                return
             emit({"kind": "tool_status", "tool": name, "state": "done", "hits": len(found_onions[:8]), "detail": f"{len(found_onions[:8])} .onion hit(s) via Tor"})
 
+    def _safe_run_one(spec: dict[str, Any]) -> None:
+        name = spec["name"]
+        try:
+            _run_one(spec)
+        except Exception as exc:
+            emit(
+                {
+                    "kind": "tool_status",
+                    "tool": name,
+                    "state": "error",
+                    "hits": 0,
+                    "detail": str(exc)[:120],
+                }
+            )
+            return
+        if name not in _TERMINAL_EMITTED:
+            emit(
+                {
+                    "kind": "tool_status",
+                    "tool": name,
+                    "state": "error",
+                    "hits": 0,
+                    "detail": "no terminal status emitted",
+                }
+            )
+
     with ThreadPoolExecutor(max_workers=6) as pool:
-        list(pool.map(_run_one, TOOL_CATALOG))
+        futures = {pool.submit(_safe_run_one, spec): spec["name"] for spec in TOOL_CATALOG}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            exc = fut.exception()
+            if exc is not None:
+                emit(
+                    {
+                        "kind": "tool_status",
+                        "tool": name,
+                        "state": "error",
+                        "hits": 0,
+                        "detail": str(exc)[:120],
+                    }
+                )
 
 
 def main() -> int:
@@ -1020,6 +1165,8 @@ def main() -> int:
         try:
             payload = json.loads(args.payload)
         except json.JSONDecodeError:
+            payload = {}
+        if not isinstance(payload, dict):
             payload = {}
         run_sidecar(payload)
         return 0

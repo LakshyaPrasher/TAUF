@@ -5,6 +5,7 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 import tls from "node:tls";
 import zlib from "node:zlib";
 import { spawn, spawnSync } from "node:child_process";
@@ -12,7 +13,7 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const SERVER_BUILD_ID = "v5.3-darkweb-clarity";
+const SERVER_BUILD_ID = "v5.4-audit-hardened";
 
 const DIST_DIR = path.join(__dirname, "dist");
 const WMN_PATH = path.join(__dirname, "src-tauri", "resources", "wmn_curated.json");
@@ -240,44 +241,104 @@ const TIMEZONE_HINTS = {
 
 function loadJson(file, fallback) {
   try {
-    if (fs.existsSync(file)) {
-      return JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (err) {
+    // PF-1/PF-2: never silently degrade to `{}` — quarantine the bad file so it
+    // can be inspected, and keep the app bootable.
+    try {
+      const quarantine = `${file}.corrupt-${Date.now()}`;
+      fs.renameSync(file, quarantine);
+      logRuntime(
+        `[Vault] Corrupt JSON quarantined: ${path.basename(file)} -> ${path.basename(
+          quarantine
+        )} (${err && err.message ? err.message : String(err)})`
+      );
+    } catch {
+      // ignore quarantine failure
     }
-  } catch {
-    // ignore corrupt file
+    return fallback;
   }
-  return fallback;
 }
 
 function saveJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
-  fs.renameSync(tmp, file);
+  const payload = JSON.stringify(data, null, 2);
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  const bak = `${file}.bak`;
+  let fd = null;
+  try {
+    fd = fs.openSync(tmp, "w");
+    fs.writeFileSync(fd, payload, "utf8");
+    try {
+      fs.fsyncSync(fd);
+    } catch {
+      // fsync may be unsupported on some filesystems; the rename is still atomic.
+    }
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+  try {
+    if (fs.existsSync(file)) {
+      try {
+        fs.copyFileSync(file, bak);
+      } catch {
+        // best-effort backup
+      }
+    }
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // ignore cleanup failure
+    }
+    throw err;
+  }
 }
 
 function loadDefaultConfig() {
-  const loaded = loadJson(CONFIG_FILE, {});
+  const loadedRaw = loadJson(CONFIG_FILE, {});
+  const loaded =
+    loadedRaw && typeof loadedRaw === "object" && !Array.isArray(loadedRaw) ? loadedRaw : {};
   let seeds =
     Array.isArray(loaded.custom_onion_seeds) && loaded.custom_onion_seeds.length > 0
       ? [...loaded.custom_onion_seeds]
       : [...DEFAULT_ONION_SEEDS];
   // Auto-arm OnionLand v3 alongside Ahmia v3 for existing installs
-  if (!seeds.some((s) => s.includes("3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad"))) {
+  if (!seeds.some((s) => typeof s === "string" && s.includes("3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad"))) {
     seeds.push(`${ONIONLAND_V3_BASE}/search?q={query}`);
   }
   const cfg = {
-    tor_socks_url: loaded.tor_socks_url || "socks5h://127.0.0.1:9050",
-    proxy_url: loaded.proxy_url || null,
-    local_corpus_dir: loaded.local_corpus_dir?.trim() || DEFAULT_CORPUS_DIR,
+    tor_socks_url: typeof loaded.tor_socks_url === "string" && loaded.tor_socks_url.trim()
+      ? loaded.tor_socks_url
+      : "socks5h://127.0.0.1:9050",
+    proxy_url: typeof loaded.proxy_url === "string" && loaded.proxy_url.trim() ? loaded.proxy_url : null,
+    local_corpus_dir:
+      typeof loaded.local_corpus_dir === "string" && loaded.local_corpus_dir.trim()
+        ? loaded.local_corpus_dir.trim()
+        : DEFAULT_CORPUS_DIR,
     custom_onion_seeds: seeds,
   };
   saveJson(CONFIG_FILE, cfg);
   return cfg;
 }
 
+// PF-2: a `cases.json` of `null` / an array must never throw before `listen()`.
+const loadedCases = loadJson(CASES_FILE, {});
+const safeCases =
+  loadedCases && typeof loadedCases === "object" && !Array.isArray(loadedCases)
+    ? loadedCases
+    : {};
+
 const state = {
-  cases: new Map(Object.entries(loadJson(CASES_FILE, {}))),
+  cases: new Map(Object.entries(safeCases)),
   config: loadDefaultConfig(),
   sseClients: new Set(),
   hasHadSseClient: false,
@@ -324,9 +385,27 @@ function broadcastEvent(ev) {
   const payload = `data: ${JSON.stringify(ev)}\n\n`;
   for (const res of state.sseClients) {
     try {
-      res.write(payload);
+      if (res.writableEnded || res.destroyed) {
+        state.sseClients.delete(res);
+        continue;
+      }
+      const drained = res.write(payload);
+      if (!drained || res.writableLength > 8 * 1024 * 1024) {
+        // LC-4: never let a stalled client grow the buffer without bound.
+        state.sseClients.delete(res);
+        try {
+          res.destroy();
+        } catch {
+          // ignore
+        }
+      }
     } catch {
       state.sseClients.delete(res);
+      try {
+        res.destroy();
+      } catch {
+        // ignore
+      }
     }
   }
 }
@@ -377,6 +456,47 @@ async function detectLocalTor(customUrl) {
   return { available: false, endpoint: null, host: null, port: null };
 }
 
+/**
+ * Shared network-context resolution (PR-2): Tor first, then the configured
+ * custom SOCKS5h proxy. Used by both `runInvestigation` and `runDeepenNode` so
+ * the two paths can never disagree about anonymity routing.
+ */
+async function resolveNetContext(auth, input) {
+  const tor = await detectLocalTor(auth?.tor_socks_url);
+  const customProxy = auth?.proxy_url?.trim() ? ensureSocks5h(auth.proxy_url) : null;
+  let proxyHost = null;
+  let proxyPort = null;
+  let torEndpoint = null;
+
+  if (tor.available && (input?.enable_tor || input?.strict_anonymity !== false)) {
+    proxyHost = tor.host;
+    proxyPort = tor.port;
+    torEndpoint = tor.endpoint;
+  } else if (customProxy) {
+    try {
+      const pu = new URL(customProxy);
+      proxyHost = pu.hostname;
+      proxyPort = Number(pu.port) || 1080;
+      torEndpoint = customProxy;
+    } catch {
+      // invalid proxy
+    }
+  }
+
+  const strictAnonymity =
+    typeof input?.strict_anonymity === "boolean"
+      ? input.strict_anonymity
+      : Boolean(tor.available);
+
+  return {
+    strictAnonymity,
+    proxyHost,
+    proxyPort,
+    torEndpoint,
+    anonymityMode: tor.available && proxyHost ? "tor_socks5h" : proxyHost ? "custom_proxy" : "direct",
+  };
+}
+
 function ensureSocks5h(raw) {
   const trimmed = String(raw || "").trim();
   if (!trimmed) return "";
@@ -384,6 +504,24 @@ function ensureSocks5h(raw) {
   if (trimmed.startsWith("socks5://")) return `socks5h://${trimmed.slice(9)}`;
   if (trimmed.includes("://")) return trimmed;
   return `socks5h://${trimmed}`;
+}
+
+// SEC-4: never return a proxy password to the renderer/API. The real value stays
+// server-side in state.config; only the masked form crosses the IPC boundary.
+function redactProxyUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  try {
+    const u = new URL(value);
+    if (u.username || u.password) {
+      // Preserve the username for display; only the secret is masked.
+      if (u.password) u.password = "***";
+      return u.toString().replace(/\/$/, "");
+    }
+    return value;
+  } catch {
+    return value.replace(/\/\/[^@/]*@/, "//***@");
+  }
 }
 
 /**
@@ -570,12 +708,23 @@ function openSocks5hTunnel(proxyHost, proxyPort, targetHost, targetPort, timeout
       sock.write(authUser ? Buffer.from([0x05, 0x01, 0x02]) : Buffer.from([0x05, 0x01, 0x00]));
     });
 
+    // SOCKS5 replies are length-framed, not read-framed: one TCP segment may deliver
+    // only part of a reply (or several replies at once). Accumulate into replyBuf and
+    // never treat leftover bytes as HTTP/TLS — the CONNECT reply tail
+    // (ATYP + BND.ADDR + BND.PORT) belongs to SOCKS, not to the tunnel payload.
+    let replyBuf = Buffer.alloc(0);
+
     const onData = (buf) => {
+      replyBuf = replyBuf.length ? Buffer.concat([replyBuf, buf]) : buf;
       if (stage === 0) {
-        if (buf.length < 2 || buf[0] !== 0x05) {
+        // Method selection reply: VER, METHOD
+        if (replyBuf.length < 2) return;
+        if (replyBuf[0] !== 0x05) {
           return fail(new Error("SOCKS5 auth negotiation failed"));
         }
-        if (authUser && buf[1] === 0x02) {
+        const method = replyBuf[1];
+        replyBuf = replyBuf.subarray(2);
+        if (authUser && method === 0x02) {
           const uBuf = Buffer.from(authUser, "utf8");
           const pBuf = Buffer.from(authUser, "utf8");
           const authReq = Buffer.alloc(3 + uBuf.length + pBuf.length);
@@ -588,23 +737,40 @@ function openSocks5hTunnel(proxyHost, proxyPort, targetHost, targetPort, timeout
           sock.write(authReq);
           return;
         }
-        if (buf[1] !== 0x00) {
+        if (method !== 0x00) {
           return fail(new Error("SOCKS5 auth negotiation failed"));
         }
         sendConnect();
       } else if (stage === 0.5) {
-        if (buf.length < 2 || buf[0] !== 0x01 || buf[1] !== 0x00) {
+        // RFC 1929 auth reply: VER=0x01, STATUS
+        if (replyBuf.length < 2) return;
+        if (replyBuf[0] !== 0x01 || replyBuf[1] !== 0x00) {
           return fail(new Error("SOCKS5 RFC1929 authentication failed"));
         }
+        replyBuf = replyBuf.subarray(2);
         sendConnect();
       } else if (stage === 1) {
-        if (buf.length < 2 || buf[0] !== 0x05 || buf[1] !== 0x00) {
-          return fail(new Error(`SOCKS5h connect failed (reply=0x${buf[1]?.toString(16) || "ff"})`));
+        // CONNECT reply: VER, REP, RSV, ATYP, BND.ADDR, BND.PORT
+        if (replyBuf.length < 4) return;
+        if (replyBuf[0] !== 0x05) {
+          return fail(new Error("SOCKS5h connect failed (bad reply version)"));
         }
+        if (replyBuf[1] !== 0x00) {
+          return fail(new Error(`SOCKS5h connect failed (reply=0x${replyBuf[1].toString(16)})`));
+        }
+        const atyp = replyBuf[3];
+        if (atyp !== 1 && atyp !== 3 && atyp !== 4) {
+          return fail(new Error(`SOCKS5h connect failed (ATYP=0x${atyp.toString(16)})`));
+        }
+        const need = 4 + (atyp === 1 ? 4 : atyp === 4 ? 16 : 1 + (replyBuf[4] || 0)) + 2;
+        if (replyBuf.length < need) return;
+        const rest = replyBuf.subarray(need);
         settled = true;
         sock.removeListener("data", onData);
         sock.removeListener("timeout", onTimeout);
         sock.removeListener("error", onError);
+        sock.pause();
+        if (rest.length) sock.unshift(rest);
         resolve(sock);
       }
     };
@@ -621,22 +787,45 @@ function openSocks5hTunnel(proxyHost, proxyPort, targetHost, targetPort, timeout
 function decodeChunkedBody(buf) {
   const parts = [];
   let offset = 0;
+  let sawChunk = false;
+  let sawSizeLine = false;
+  let truncated = false;
   while (offset < buf.length) {
     const crlf = buf.indexOf("\r\n", offset);
-    if (crlf === -1) break;
+    if (crlf === -1) {
+      // Trailing partial size line: keep whatever body we already decoded.
+      truncated = sawSizeLine;
+      break;
+    }
     const sizeHex = buf.subarray(offset, crlf).toString("ascii").split(";")[0].trim();
     const size = parseInt(sizeHex, 16);
-    if (!Number.isFinite(size) || size <= 0) break;
+    if (!Number.isFinite(size) || Number.isNaN(size)) {
+      // Not actually chunked (mislabeled Transfer-Encoding) — never return an
+      // empty buffer; hand the raw payload back to the caller instead.
+      return { buf, truncated: false, mislabeled: true };
+    }
+    sawSizeLine = true;
+    if (size === 0) break; // terminal chunk
+    sawChunk = true;
     const start = crlf + 2;
     const end = start + size;
     if (end > buf.length) {
       parts.push(buf.subarray(start));
+      truncated = true;
       break;
     }
     parts.push(buf.subarray(start, end));
     offset = end + 2;
+    if (offset >= buf.length) {
+      // Missing trailing CRLF/trailer after the last chunk.
+      truncated = true;
+    }
   }
-  return Buffer.concat(parts);
+  if (!sawSizeLine) {
+    // No chunk framing at all; treat the buffer as a raw body.
+    return { buf, truncated: false, mislabeled: true };
+  }
+  return { buf: Buffer.concat(parts), truncated };
 }
 
 async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectDepth = 0) {
@@ -685,10 +874,11 @@ async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectD
       })
     : rawSock;
 
-  const responseBuf = await new Promise((resolve, reject) => {
+  const responseData = await new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
     let done = false;
+    let capped = false;
     const finish = (err, data) => {
       if (done) return;
       done = true;
@@ -698,7 +888,7 @@ async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectD
         // ignore
       }
       if (err) reject(err);
-      else resolve(data);
+      else resolve({ buf: data, capped });
     };
 
     const reqPath = `${parsed.pathname || "/"}${parsed.search || ""}`;
@@ -725,6 +915,7 @@ async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectD
       chunks.push(chunk);
       total += chunk.length;
       if (total >= maxBytes) {
+        capped = true;
         finish(null, Buffer.concat(chunks));
       }
     });
@@ -735,6 +926,8 @@ async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectD
     stream.write(`${method} ${reqPath} HTTP/1.1\r\n${headerLines}\r\n\r\n`);
   });
 
+  const responseBuf = responseData.buf;
+  const readCapped = responseData.capped;
   const sepIdx = responseBuf.indexOf("\r\n\r\n");
   if (sepIdx === -1) {
     throw new Error("Malformed HTTP response over SOCKS5h");
@@ -757,26 +950,63 @@ async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectD
     return socks5hRequest(proxyHost, proxyPort, nextUrl, opts, redirectDepth + 1);
   }
 
+  let truncated = readCapped;
+  let compressionFailed = false;
+  let compression = null;
+  let partial = false;
+  let undecodableEncoding = null;
   if (method !== "HEAD") {
     const te = (headers.get("transfer-encoding") || "").toLowerCase();
+    const declaredLength = Number(headers.get("content-length"));
     if (te.includes("chunked")) {
-      bodyBuf = decodeChunkedBody(bodyBuf);
+      const decoded = decodeChunkedBody(bodyBuf);
+      bodyBuf = decoded.buf;
+      if (decoded.truncated) truncated = true;
+    } else if (Number.isFinite(declaredLength) && declaredLength > bodyBuf.length) {
+      // NET-4: FIN before the declared Content-Length — flag a truncated body
+      // instead of silently treating a partial payload as complete.
+      truncated = true;
     }
     const ce = (headers.get("content-encoding") || "").toLowerCase();
+    compression = ce || null;
     const decompressPartial = (buf, fn) => {
+      const maxOutputLength = Math.max(64 * 1024, maxBytes * 4);
       for (let trim = 0; trim <= 8 && trim < buf.length; trim++) {
         try {
           const slice = trim === 0 ? buf : buf.subarray(0, buf.length - trim);
-          return fn(slice, { finishFlush: zlib.constants.Z_SYNC_FLUSH });
+          const out = fn(slice, {
+            finishFlush: zlib.constants.Z_SYNC_FLUSH,
+            maxOutputLength,
+          });
+          if (trim > 0) partial = true;
+          return out;
         } catch {
           // retry trimming partial trailing byte/trailer
         }
       }
-      return buf;
+      return null;
     };
-    if (ce.includes("gzip")) bodyBuf = decompressPartial(bodyBuf, zlib.gunzipSync);
-    else if (ce.includes("deflate")) bodyBuf = decompressPartial(bodyBuf, zlib.inflateSync);
+    if (ce.includes("br") || ce.includes("zstd")) {
+      // NET-5: we only advertise gzip/deflate; refuse to emit still-compressed
+      // bytes as if they were text, and label the fallback instead.
+      undecodableEncoding = ce;
+      compressionFailed = true;
+    } else if (ce.includes("gzip")) {
+      const out = decompressPartial(bodyBuf, zlib.gunzipSync);
+      if (out) bodyBuf = out;
+      else compressionFailed = true;
+    } else if (ce.includes("deflate")) {
+      const out = decompressPartial(bodyBuf, zlib.inflateSync);
+      if (out) bodyBuf = out;
+      else compressionFailed = true;
+    }
   }
+
+  const fallbackNote = undecodableEncoding
+    ? `[TAUF: unsupported content-encoding "${undecodableEncoding}" — body not decoded]`
+    : compressionFailed
+    ? "[TAUF: compressed body could not be decompressed — raw bytes preserved in buffer()]"
+    : null;
 
   return {
     ok: status >= 200 && status < 300,
@@ -785,32 +1015,72 @@ async function socks5hRequest(proxyHost, proxyPort, rawUrl, opts = {}, redirectD
     headers: {
       get: (k) => headers.get(String(k).toLowerCase()) || null,
     },
-    text: async () => bodyBuf.toString("utf8"),
+    // NET-4 / NET-5: body bytes are only exposed as text when they are really
+    // decoded; otherwise a labelled fallback keeps a silent-garbage body legible.
+    text: async () => (fallbackNote ? fallbackNote : bodyBuf.toString("utf8")),
     arrayBuffer: async () => bodyBuf,
     buffer: bodyBuf,
+    ...(truncated ? { truncated: true } : {}),
+    ...(compressionFailed ? { compressionFailed: true } : {}),
+    ...(partial ? { partial: true } : {}),
+    ...(compression ? { compression } : {}),
   };
 }
 
 async function fetchDirectWithTimeout(url, options = {}, timeoutMs = 8500) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const timer = setTimeout(() => {
+    try {
+      ctrl.abort(new Error(`Direct fetch timed out after ${timeoutMs}ms`));
+    } catch {
+      ctrl.abort();
+    }
+  }, timeoutMs);
+  timer.unref?.();
+  const headers = {
+    "User-Agent": UA,
+    ...(options.headers || {}),
+  };
+  delete headers.Referer;
+  delete headers.referer;
+  let resp;
   try {
-    const headers = {
-      "User-Agent": UA,
-      ...(options.headers || {}),
-    };
-    delete headers.Referer;
-    delete headers.referer;
-    const resp = await fetch(url, {
+    resp = await fetch(url, {
       ...options,
       signal: ctrl.signal,
       headers,
       redirect: "follow",
     });
-    return resp;
-  } finally {
+  } catch (err) {
     clearTimeout(timer);
+    throw err;
   }
+  // NET-3: keep the abort timer armed until the body is fully consumed so a
+  // slow-loris body cannot hang a stage forever after headers arrive.
+  const disarm = () => clearTimeout(timer);
+  const underDeadline = (fn) => async (...args) => {
+    try {
+      return await fn(...args);
+    } finally {
+      disarm();
+    }
+  };
+  return {
+    ok: resp.ok,
+    status: resp.status,
+    statusText: resp.statusText,
+    url: resp.url,
+    redirected: resp.redirected,
+    type: resp.type,
+    headers: resp.headers,
+    body: resp.body,
+    bodyUsed: resp.bodyUsed,
+    text: underDeadline(() => resp.text()),
+    json: underDeadline(() => resp.json()),
+    arrayBuffer: underDeadline(() => resp.arrayBuffer()),
+    blob: underDeadline(() => resp.blob()),
+    clone: () => resp.clone(),
+  };
 }
 
 /**
@@ -879,13 +1149,19 @@ async function checkTorExitIp(host, port, forceRefresh = false) {
 
 function normalizeNodeId(kind, value) {
   const cleanKind = String(kind || "entity").trim().toLowerCase();
-  const cleanVal = String(value || "")
+  const rawValue = String(value || "");
+  const cleanVal = rawValue
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9._\-@+:]/g, "_")
     .split("_")
     .filter(Boolean)
     .join("_");
+  if (!cleanVal) {
+    // G9 / ACC-9: never collapse distinct non-ASCII values into `kind:`.
+    const digest = crypto.createHash("sha1").update(rawValue).digest("hex").slice(0, 12);
+    return `${cleanKind}:h_${digest}`;
+  }
   return `${cleanKind}:${cleanVal}`;
 }
 
@@ -941,6 +1217,24 @@ const PLATFORM_SLUG_ALIASES = {
   "behance.net": "behance",
   dribbble: "dribbble",
   "dribbble.com": "dribbble",
+  "chess.com": "chess",
+  chess: "chess",
+  "hackaday.io": "hackaday",
+  hackaday: "hackaday",
+  "ko-fi": "kofi",
+  kofi: "kofi",
+  replit: "replit",
+  "replit.com": "replit",
+  steam: "steam",
+  "steam community (user)": "steam",
+  "steamcommunity.com": "steam",
+  buymeacoffee: "buymeacoffee",
+  "buy me a coffee": "buymeacoffee",
+  "buymeacoffee.com": "buymeacoffee",
+  speakerdeck: "speakerdeck",
+  "speaker deck": "speakerdeck",
+  "speakerdeck.com": "speakerdeck",
+  "github gist": "gist",
 };
 
 function normalizePlatformSlug(platform) {
@@ -957,12 +1251,21 @@ function normalizePlatformSlug(platform) {
 
 function normalizeAccountNodeId(platform, handle) {
   const platSlug = normalizePlatformSlug(platform);
-  const cleanHandle = String(handle || "")
+  const rawHandle = String(handle || "");
+  let cleanHandle = rawHandle
     .trim()
     .replace(/^@+/, "")
     .replace(/[/?#].*$/, "")
     .toLowerCase();
-  return normalizeNodeId("account", `${platSlug}@${cleanHandle || "unknown"}`);
+  if (!cleanHandle || cleanHandle === "unknown") {
+    // G9 / ACC-9: never emit the shared `account:<platform>@unknown` id.
+    cleanHandle = `h_${crypto
+      .createHash("sha1")
+      .update(`${platSlug}|${rawHandle}`)
+      .digest("hex")
+      .slice(0, 12)}`;
+  }
+  return normalizeNodeId("account", `${platSlug}@${cleanHandle}`);
 }
 
 function normUrlForMatch(u) {
@@ -1155,19 +1458,24 @@ function buildCanonicalProfileUrl(platform, handle) {
  */
 function ensureGraphIntegrity(snap, seedId) {
   const nodeMap = new Map(snap.nodes.map((n) => [n.id, n]));
+  // G2 / ACC-2: quarantined nodes are not part of the graph — no edges, no depth, no stats.
+  const quarantinedIds = new Set(
+    snap.nodes.filter((n) => n.status === "quarantined").map((n) => n.id)
+  );
   const seenEdgeIds = new Set();
   const cleanEdges = [];
   for (const e of snap.edges) {
     if (!e || !e.source || !e.target) continue;
     if (e.source === e.target) continue;
     if (!nodeMap.has(e.source) || !nodeMap.has(e.target)) continue;
+    if (quarantinedIds.has(e.source) || quarantinedIds.has(e.target)) continue;
     if (seenEdgeIds.has(e.id)) continue;
     seenEdgeIds.add(e.id);
     cleanEdges.push(e);
   }
   snap.edges = cleanEdges;
 
-  if (!nodeMap.has(seedId)) return;
+  if (!nodeMap.has(seedId) || quarantinedIds.has(seedId)) return;
 
   // Compute reachability & hop depth from seedId (directed first, undirected fallback for any reverse edges)
   const dirAdj = new Map();
@@ -1207,23 +1515,14 @@ function ensureGraphIntegrity(snap, seedId) {
     }
   }
 
-  // Pass 3: attach any truly orphan nodes to seedId so 0 orphan nodes remain
+  // G11 / ACC-8: never fabricate `related_entity` edges to make orphans look connected.
+  // Unreachable nodes keep their existing depth (UI compatibility) and are marked
+  // `reachable:false` for display/telemetry only.
   for (const n of snap.nodes) {
-    if (!depths.has(n.id)) {
-      const edge = upsertEdge(snap, {
-        id: `${seedId}__related_entity__${n.id}`,
-        source: seedId,
-        target: n.id,
-        relation: "related_entity",
-        confidence: Math.min(0.75, n.confidence || 0.6),
-        sources: n.sources?.length ? [n.sources[0]] : ["graph-integrity"],
-      });
-      broadcastEvent({ kind: "edge", case_id: snap.case_id, edge });
-      depths.set(n.id, 1);
-    }
-  }
-
-  for (const n of snap.nodes) {
+    if (quarantinedIds.has(n.id)) continue;
+    const reachable = depths.has(n.id);
+    n.metadata = { ...(n.metadata || {}), reachable };
+    if (!reachable) continue;
     const d = depths.get(n.id);
     if (typeof d === "number" && n.depth !== d) {
       n.depth = d;
@@ -1239,11 +1538,18 @@ function mergeConfidence(existing, incoming, sourceCount) {
 }
 
 function computeStats(nodes, findings, toolRuns) {
-  const activeNodes = nodes.filter((n) => n.status !== "dismissed");
+  const quarantinedIds = new Set(
+    nodes.filter((n) => n.status === "quarantined").map((n) => n.id)
+  );
+  const activeNodes = nodes.filter(
+    (n) => n.status !== "dismissed" && n.status !== "quarantined"
+  );
   const dismissedIds = new Set(
     nodes.filter((n) => n.status === "dismissed").map((n) => n.id)
   );
-  const activeFindings = findings.filter((f) => !dismissedIds.has(f.node_id));
+  const activeFindings = findings.filter(
+    (f) => !dismissedIds.has(f.node_id) && !quarantinedIds.has(f.node_id)
+  );
   const confirmedAnchors = activeNodes.filter(
     (n) =>
       n.status === "confirmed" ||
@@ -1260,6 +1566,7 @@ function computeStats(nodes, findings, toolRuns) {
   ).length;
   return {
     total_nodes: activeNodes.length,
+    quarantined_nodes: quarantinedIds.size,
     confirmed_anchors: confirmedAnchors,
     verified_findings: verifiedFindings,
     low_conf_findings: Math.max(0, activeFindings.length - verifiedFindings),
@@ -1273,19 +1580,40 @@ function computeStats(nodes, findings, toolRuns) {
 function upsertNode(snap, incoming) {
   const idx = snap.nodes.findIndex((n) => n.id === incoming.id);
   if (idx === -1) {
-    snap.nodes.push(incoming);
-    return incoming;
+    const node = { ...incoming };
+    // G2 / ACC-2: collision-tier accounts are quarantined — no edges, findings, depth or stats.
+    if (node.kind === "account" && node.metadata?.match_tier === "collision") {
+      node.status = "quarantined";
+    }
+    snap.nodes.push(node);
+    return node;
   }
   const ex = snap.nodes[idx];
-  const sources = Array.from(new Set([...ex.sources, ...incoming.sources]));
-  const mergedMeta = { ...ex.metadata, ...incoming.metadata };
   // Never downgrade a verified match_tier back to collision/probable
   const tierRank = { verified: 3, probable: 2, collision: 1 };
   const exRank = tierRank[ex.metadata?.match_tier] || 0;
   const inRank = tierRank[incoming.metadata?.match_tier] || 0;
+  // G10 / ACC-3: a lower-tier source is conflicting evidence, never corroboration.
+  const conflicted = exRank > 0 && inRank > 0 && inRank < exRank;
+  const sources = conflicted
+    ? Array.from(new Set(ex.sources || []))
+    : Array.from(new Set([...(ex.sources || []), ...(incoming.sources || [])]));
+  const mergedMeta = { ...ex.metadata, ...incoming.metadata };
   if (exRank > inRank) {
     mergedMeta.match_tier = ex.metadata.match_tier;
     if (ex.metadata.match_reason) mergedMeta.match_reason = ex.metadata.match_reason;
+    // Do not let weaker evidence overwrite stronger identity fields.
+    for (const key of ["display_name", "bio"]) {
+      if (ex.metadata?.[key] !== undefined) mergedMeta[key] = ex.metadata[key];
+      else delete mergedMeta[key];
+    }
+  }
+  if (conflicted) {
+    const conflicts = new Set([
+      ...(ex.metadata?.conflict_sources || []),
+      ...(incoming.sources || []),
+    ]);
+    mergedMeta.conflict_sources = Array.from(conflicts);
   }
 
   const merged = {
@@ -1298,14 +1626,21 @@ function upsertNode(snap, incoming) {
         : incoming.layer === "anchor" || incoming.layer === "darkweb"
         ? incoming.layer
         : ex.layer,
-    confidence:
-      mergedMeta.match_tier === "collision"
-        ? Math.min(0.46, Math.max(ex.confidence, incoming.confidence))
-        : mergeConfidence(ex.confidence, incoming.confidence, sources.length),
+    confidence: conflicted
+      ? ex.confidence
+      : mergedMeta.match_tier === "collision"
+      ? Math.min(0.46, Math.max(ex.confidence, incoming.confidence))
+      : mergeConfidence(ex.confidence, incoming.confidence, sources.length),
     sources,
     metadata: mergedMeta,
     depth: Math.min(ex.depth, incoming.depth),
   };
+  if (merged.kind === "account" && mergedMeta.match_tier === "collision") {
+    merged.status = "quarantined";
+  } else if (merged.status === "quarantined" && inRank > exRank) {
+    // Stronger evidence rehabilitates a previously quarantined account.
+    merged.status = "unverified";
+  }
   snap.nodes[idx] = merged;
   return merged;
 }
@@ -1334,15 +1669,36 @@ function upsertFinding(snap, incoming) {
     return incoming;
   }
   const ex = snap.findings[idx];
+  // G10 / ACC-3: a lower-tier (e.g. collision) finding must not raise the
+  // consensus/confidence of a stronger existing finding.
+  const tierRank = { verified: 3, probable: 2, collision: 1 };
+  const rankOf = (f) => {
+    const explicit = f?.metadata?.match_tier || f?.match_tier;
+    if (explicit && tierRank[explicit]) return tierRank[explicit];
+    const c = Number(f?.confidence) || 0;
+    return c >= 0.8 ? 3 : c >= 0.52 ? 2 : 1;
+  };
+  const conflicted = rankOf(incoming) < rankOf(ex);
   const sources = Array.from(new Set([...ex.sources, ...incoming.sources]));
   const merged = {
     ...ex,
     sources,
-    consensus_count: sources.length,
-    confidence: mergeConfidence(ex.confidence, incoming.confidence, sources.length),
+    consensus_count: conflicted
+      ? ex.consensus_count || 0
+      : Math.max(ex.consensus_count || 0, sources.length),
+    confidence: conflicted
+      ? ex.confidence
+      : mergeConfidence(ex.confidence, incoming.confidence, sources.length),
     sensitive_fields: Array.from(
       new Set([...ex.sensitive_fields, ...incoming.sensitive_fields])
     ),
+    ...(conflicted
+      ? {
+          conflict_sources: Array.from(
+            new Set([...(ex.conflict_sources || []), ...(incoming.sources || [])])
+          ),
+        }
+      : {}),
   };
   snap.findings[idx] = merged;
   return merged;
@@ -1370,6 +1726,91 @@ function hasFullNameMatch(text, fullName) {
   const first = parts[0];
   const last = parts[parts.length - 1];
   return low.includes(first) && low.includes(last);
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeNameText(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Deterministic name-evidence gate (G1 / ACC-1).
+ * `hasFullNameMatch` only decides whether a result is worth considering; this decides
+ * whether the result may be called verified. Token-boundary based (never raw substring),
+ * so "Raj" never matches "Rajasthan" and "Raj Sharma" never matches "Rajesh Sharma".
+ *
+ * strong      — contiguous full-name phrase (punctuation/whitespace-insensitive),
+ *               OR first→last within 60 chars / ≤3 intervening tokens,
+ *               OR reversed "Last, First".
+ * proximity   — both name tokens with boundaries within 120 chars, either order.
+ * tokenBoundary — at least one token (len ≥ 3) appears as a whole word.
+ */
+function nameEvidence(text, fullName) {
+  const evidence = { strong: false, proximity: false, tokenBoundary: false, matched: false };
+  const normText = normalizeNameText(text);
+  const tokens = normalizeNameText(fullName).split(" ").filter((t) => t.length >= 2);
+  if (!normText || tokens.length === 0) return evidence;
+
+  const spans = [];
+  const wordRe = /[\p{L}\p{N}_]+/gu;
+  let m;
+  while ((m = wordRe.exec(normText)) !== null) {
+    spans.push({ token: m[0], start: m.index, end: m.index + m[0].length });
+  }
+  if (spans.length === 0) return evidence;
+
+  const sequence = ` ${spans.map((s) => s.token).join(" ")} `;
+  const phrase = tokens.join(" ");
+  if (sequence.includes(` ${phrase} `)) evidence.strong = true;
+
+  const hasToken = (tok) => spans.some((s) => s.token === tok);
+  const positionsOf = (tok) => spans.filter((s) => s.token === tok);
+
+  if (tokens.length >= 2) {
+    const first = tokens[0];
+    const last = tokens[tokens.length - 1];
+    if (first !== last) {
+      const firstPos = positionsOf(first);
+      const lastPos = positionsOf(last);
+      const forwardStrong = firstPos.some((a) =>
+        lastPos.some((b) => {
+          if (b.start < a.end || b.start - a.end > 60) return false;
+          const between = spans.filter((s) => s.start >= a.end && s.end <= b.start).length;
+          return between <= 3;
+        })
+      );
+      const reverseStrong = lastPos.some((a) =>
+        firstPos.some((b) => {
+          if (b.start < a.end || b.start - a.end > 1) return false;
+          return !spans.some((s) => s.start >= a.end && s.end <= b.start);
+        })
+      );
+      if (forwardStrong || reverseStrong) evidence.strong = true;
+      evidence.proximity = firstPos.some((a) =>
+        lastPos.some((b) => Math.abs(b.start - a.start) <= 120)
+      );
+    } else {
+      evidence.proximity = hasToken(first);
+    }
+  } else {
+    const tokenRe = new RegExp(
+      `(?:^|[^\\p{L}\\p{N}])${escapeRegExp(tokens[0])}(?:$|[^\\p{L}\\p{N}])`,
+      "u"
+    );
+    evidence.proximity = tokenRe.test(normText);
+  }
+
+  evidence.tokenBoundary = tokens.some((t) => t.length >= 3 && hasToken(t));
+  evidence.matched = evidence.strong || evidence.proximity || evidence.tokenBoundary;
+  return evidence;
 }
 
 function sharesNameToken(candidate, fullName) {
@@ -1524,8 +1965,12 @@ async function inspectDomainDns(domain, netCtx) {
     dmarc_record: null,
     mail_provider_hint: null,
   };
-  // In strict anonymity mode routed over Tor, skip local UDP DNS to avoid local DNS leak!
-  if (netCtx?.strictAnonymity && netCtx?.proxyHost) {
+  // PR-3: in strict anonymity mode never touch the local OS resolver — even if the
+  // Tor/proxy socket is momentarily missing (falling back to UDP here would leak DNS).
+  if (netCtx?.strictAnonymity) {
+    report.skipped = netCtx?.proxyHost
+      ? "strict-anonymity-tor-no-udp"
+      : "strict-anonymity-no-proxy";
     return report;
   }
   try {
@@ -2172,7 +2617,16 @@ function stripBoilerplateHtml(html) {
   return s;
 }
 
-function scoreProfileMatch(signals, fullName, knownOrgs, knownDomains, knownEmails, isSeedHandle) {
+function scoreProfileMatch(
+  signals,
+  fullName,
+  knownOrgs,
+  knownDomains,
+  knownEmails,
+  isSeedHandle,
+  siteBrand = "",
+  handle = ""
+) {
   const rawTitle = String(signals.title || "");
   const rawDesc = String(signals.description || "");
   const isGistBoilerplate = /(?:['’`]|&#39;|&rsquo;|&apos;)s\s+gists\b/i.test(rawTitle) || /github gist:\s*star and fork/i.test(rawDesc);
@@ -2181,7 +2635,7 @@ function scoreProfileMatch(signals, fullName, knownOrgs, knownDomains, knownEmai
     ? rawDesc.replace(/github gist:\s*star and fork[\s\S]*?(?:on\s+github\.?|$)/gi, "")
     : rawDesc;
   const combinedText = `${cleanTitle} ${cleanDesc}`.toLowerCase();
-  const fullMatch = hasFullNameMatch(combinedText, fullName);
+  const nameEv = nameEvidence(`${cleanTitle} ${cleanDesc}`, fullName);
   const sharedOrg = knownOrgs.some((o) => o.length >= 3 && combinedText.includes(o.toLowerCase()));
   const sharedDom = knownDomains.some(
     (d) =>
@@ -2198,18 +2652,25 @@ function scoreProfileMatch(signals, fullName, knownOrgs, knownDomains, knownEmai
       match_reason: "Verified email present in profile",
     };
   }
-  if (fullMatch && (sharedOrg || sharedDom)) {
+  if (nameEv.strong && (sharedOrg || sharedDom)) {
     return {
       confidence: 0.84,
       match_tier: "verified",
-      match_reason: "Full name + org/domain confirmed",
+      match_reason: "Full name phrase + org/domain confirmed",
     };
   }
-  if (fullMatch) {
+  if ((nameEv.strong || nameEv.proximity) && (sharedOrg || sharedDom)) {
+    return {
+      confidence: 0.78,
+      match_tier: "probable",
+      match_reason: "Name tokens + org/domain signal (proximity)",
+    };
+  }
+  if (nameEv.strong || nameEv.proximity) {
     return {
       confidence: 0.74,
       match_tier: "probable",
-      match_reason: "Full name confirmed in bio",
+      match_reason: `Full name ${nameEv.strong ? "phrase" : "proximity"} confirmed in bio`,
     };
   }
   if (sharedOrg || sharedDom) {
@@ -2220,6 +2681,20 @@ function scoreProfileMatch(signals, fullName, knownOrgs, knownDomains, knownEmai
     };
   }
   if (isSeedHandle) {
+    // ACC-4: a page whose visible title is only the site brand (no handle, no name,
+    // no org/domain) is a soft-404/SPA shell, not identity evidence. Quarantine it
+    // instead of promoting it to `probable`.
+    const titleKey = cleanTitle.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const brandKey = String(siteBrand || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const handleKey = String(handle || "").toLowerCase();
+    const titleHasHandle = handleKey && cleanTitle.toLowerCase().includes(handleKey);
+    if (brandKey && titleKey === brandKey && !titleHasHandle && !nameEv.proximity) {
+      return {
+        confidence: 0.36,
+        match_tier: "collision",
+        match_reason: "Brand-only page - no identity marker",
+      };
+    }
     return {
       confidence: 0.66,
       match_tier: "probable",
@@ -2352,7 +2827,9 @@ async function runWmnForHandle(
           knownOrgs,
           knownDomains,
           knownEmails,
-          isSeedHandle
+          isSeedHandle,
+          site.name,
+          clean
         );
 
         hits.push({
@@ -2702,48 +3179,110 @@ function redactCorpusLine(line, matchedTerm) {
   return { redacted: safe, hasCred: false };
 }
 
-function scanLocalCorpus(dirPath, terms) {
+// SEC-5: the corpus folder is a read boundary. Reject the OS/system roots that turn a
+// compromised/CSRF'd config call into an arbitrary-directory read; dedicated subfolders
+// (including the default %LOCALAPPDATA%\\TAUF\\corpus) remain allowed.
+function isUnsafeCorpusRoot(dirPath) {
+  try {
+    const abs = path.resolve(String(dirPath || ""));
+    if (abs === path.parse(abs).root) return true;
+    const slash = abs.replace(/\\/g, "/").toLowerCase().replace(/\/+$/, "");
+    const home = os
+      .homedir()
+      .replace(/\\/g, "/")
+      .toLowerCase()
+      .replace(/\/+$/, "");
+    if (home && slash === home) return true;
+    // Strip the drive prefix so C:\\Windows matches /windows on every platform.
+    const normalized = slash.replace(/^[a-z]:/, "");
+    const banned = ["/windows", "/program files", "/program files (x86)", "/programdata"];
+    return banned.some((b) => normalized === b || normalized.startsWith(`${b}/`));
+  } catch {
+    return true;
+  }
+}
+
+async function scanLocalCorpus(dirPath, terms) {
+  if (!dirPath || isUnsafeCorpusRoot(dirPath)) {
+    return { filesScanned: 0, hits: [], rejected: true };
+  }
   if (!fs.existsSync(dirPath)) return { filesScanned: 0, hits: [] };
   const cleanTerms = terms.map((t) => t.trim().toLowerCase()).filter((t) => t.length >= 3);
   if (!cleanTerms.length) return { filesScanned: 0, hits: [] };
   const hits = [];
   let filesScanned = 0;
   const exts = new Set([".txt", ".csv", ".json", ".jsonl", ".log", ".tsv"]);
-  const walk = (dir, depth = 0) => {
-    if (depth > 3 || hits.length >= 25) return;
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+  const maxFileBytes = 50 * 1024 * 1024;
+  const byteBudget = 120 * 1024 * 1024;
+  const timeBudgetMs = 20_000;
+  const startedMs = Date.now();
+  let bytesRead = 0;
+  const exhausted = () =>
+    hits.length >= 25 || bytesRead >= byteBudget || Date.now() - startedMs >= timeBudgetMs;
+
+  const scanFile = async (full, entryName) => {
+    if (exhausted()) return;
+    try {
+      const stat = await fs.promises.stat(full);
+      if (!stat.isFile() || stat.size > maxFileBytes) return;
+      filesScanned++;
+      let lineNumber = 0;
+      let sinceYield = 0;
+      const stream = fs.createReadStream(full, { encoding: "utf8", highWaterMark: 1024 * 1024 });
+      const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+      try {
+        for await (const line of rl) {
+          lineNumber++;
+          bytesRead += Buffer.byteLength(line, "utf8") + 1;
+          const low = line.toLowerCase();
+          const match = cleanTerms.find((t) => low.includes(t));
+          if (match) {
+            const { redacted, hasCred } = redactCorpusLine(line, match);
+            hits.push({
+              file_name: entryName,
+              file_path: full,
+              line_number: lineNumber,
+              matched_term: match,
+              redacted_preview: redacted,
+              has_credential_shape: hasCred,
+            });
+          }
+          sinceYield++;
+          if (sinceYield >= 5000) {
+            sinceYield = 0;
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+          if (exhausted()) break;
+        }
+      } finally {
+        rl.close();
+        stream.destroy();
+      }
+    } catch {
+      // skip unreadable file
+    }
+  };
+
+  const walk = async (dir, depth = 0) => {
+    if (depth > 3 || exhausted()) return;
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (exhausted()) return;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        walk(full, depth + 1);
+        await walk(full, depth + 1);
       } else if (entry.isFile() && exts.has(path.extname(entry.name).toLowerCase())) {
         if (entry.name.toLowerCase() === "readme.txt") continue;
-        filesScanned++;
-        try {
-          const stat = fs.statSync(full);
-          if (stat.size > 50 * 1024 * 1024) continue;
-          const lines = fs.readFileSync(full, "utf8").split(/\r?\n/);
-          for (let i = 0; i < lines.length && hits.length < 25; i++) {
-            const low = lines[i].toLowerCase();
-            const match = cleanTerms.find((t) => low.includes(t));
-            if (match) {
-              const { redacted, hasCred } = redactCorpusLine(lines[i], match);
-              hits.push({
-                file_name: entry.name,
-                file_path: full,
-                line_number: i + 1,
-                matched_term: match,
-                redacted_preview: redacted,
-                has_credential_shape: hasCred,
-              });
-            }
-          }
-        } catch {
-          // skip unreadable file
-        }
+        await scanFile(full, entry.name);
       }
     }
   };
-  walk(dirPath);
+  await walk(dirPath);
   return { filesScanned, hits };
 }
 
@@ -2812,6 +3351,7 @@ function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, net
   return new Promise((resolve) => {
     const py = detectPythonPath();
     if (!py || !fs.existsSync(SIDECAR_BRIDGE)) return resolve();
+    const sidecarTimeout = { 1: 15_000, 2: 75_000, 3: 115_000, 4: 150_000 }[depthLevel] || 75_000;
     const payload = JSON.stringify({
       full_name: input.full_name,
       org: input.org,
@@ -2830,21 +3370,46 @@ function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, net
       tor_socks_url: netCtx?.torEndpoint || null,
       proxy_url: auth.proxy_url || null,
       local_corpus_dir: auth.local_corpus_dir || DEFAULT_CORPUS_DIR,
+      // SC-8: let the sidecar budget its per-email work inside the Node kill cap.
+      sidecar_budget_ms: sidecarTimeout,
     });
-    const sidecarTimeout = { 1: 15_000, 2: 75_000, 3: 115_000, 4: 150_000 }[depthLevel] || 75_000;
     const child = spawn(py, [SIDECAR_BRIDGE, "--run", "--payload", payload], {
       stdio: ["ignore", "pipe", "ignore"],
       env: buildSidecarEnv(),
       windowsHide: true,
     });
     let buf = "";
-    const timer = setTimeout(() => {
-      try {
-        child.kill();
-      } catch {
-        // ignore
+    let timedOut = false;
+    let settled = false;
+    let killFallback = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (killFallback) clearTimeout(killFallback);
+      if (timedOut) {
+        try {
+          onEvent({ kind: "tool_status", tool: "sidecar", state: "error", hits: 0, detail: "sidecar timed out" });
+        } catch {
+          // ignore listener failure
+        }
       }
       resolve();
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      // SC-2: kill the whole process tree so no Python grandchildren survive the cap.
+      try {
+        if (process.platform === "win32" && child.pid) {
+          spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+        } else {
+          child.kill("SIGKILL");
+        }
+      } catch {
+        // ignore kill failure; the fallback timer still resolves
+      }
+      if (!killFallback) killFallback = setTimeout(finish, 4000);
+      killFallback.unref?.();
     }, sidecarTimeout);
 
     child.stdout.on("data", (chunk) => {
@@ -2861,14 +3426,8 @@ function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, net
         }
       }
     });
-    child.on("close", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve();
-    });
+    child.on("close", finish);
+    child.on("error", finish);
   });
 }
 
@@ -2882,24 +3441,36 @@ function runSidecarBridge(input, auth, handles, emails, phones, profileUrls, net
  */
 function extractPublicPhones(text) {
   const found = new Set();
+  const seenDigits = new Set();
   const str = String(text || "");
+  const addPhone = (raw) => {
+    const digits = String(raw || "").replace(/\D/g, "");
+    if (
+      digits.length < 10 ||
+      digits.length > 15 ||
+      /^(\d)\1{6,}$/.test(digits) ||
+      seenDigits.has(digits)
+    ) {
+      return false;
+    }
+    seenDigits.add(digits);
+    found.add(String(raw).replace(/\s+/g, " ").trim());
+    return true;
+  };
   // 1. Explicit tel: links
   for (const m of str.matchAll(/href=["']tel:(\+?[0-9][0-9\s\-().]{8,18})["']/gi)) {
     const clean = m[1].replace(/[^\d+]/g, "");
-    const digits = clean.replace(/\D/g, "");
-    if (digits.length >= 10 && digits.length <= 15) {
-      found.add(clean.startsWith("+") ? clean : `+${clean}`);
-    }
+    addPhone(clean.startsWith("+") ? clean : `+${clean}`);
   }
-  // 2. Explicit international +CC formatted numbers in visible text
+  // 2. Explicit international +CC formatted numbers in visible text.
+  //    Allows optional parentheses around the area code and mixed separators, e.g.
+  //    "+1 (555) 123-4567", "+91 (98765) 43210", "+44 20 7946 0958".
   const plain = str.replace(/<[^>]+>/g, " ");
-  for (const m of plain.matchAll(/(?:^|[\s:(])(\+(?:1|44|91|49|33|61|65|81|86|31|46|41|358|971)[\s\-().]?\d{2,4}[\s\-().]?\d{3,4}[\s\-().]?\d{3,5})(?=$|[\s),.;])/g)) {
-    const raw = m[1].trim();
-    const digits = raw.replace(/\D/g, "");
-    if (digits.length >= 10 && digits.length <= 15 && !/^(\d)\1{6,}$/.test(digits)) {
-      found.add(raw.replace(/\s+/g, " "));
-      if (found.size >= 4) break;
-    }
+  for (const m of plain.matchAll(
+    /(?:^|[\s:(])(\+\d{1,3}[\s\-().]*\(?\d{2,5}\)?(?:[\s\-().]*\d{2,5}){1,3})(?=$|[\s),.;])/g
+  )) {
+    addPhone(m[1]);
+    if (found.size >= 4) break;
   }
   return Array.from(found);
 }
@@ -3357,15 +3928,19 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
       }
       ytCandidates.sort((a, b) => b.score - a.score);
       for (const c of ytCandidates.slice(0, 4)) {
+        // G1: only a strong title phrase earns `verified`; handle-only matches stay `probable`.
+        const ytNameEv = nameEvidence(c.chTitle, fullName);
         recordAccount({
           platform: "YouTube",
           handle: c.chHandle,
           url: `https://www.youtube.com/@${c.chHandle}`,
           title: c.chTitle,
           bio: `YouTube channel "${c.chTitle}" (@${c.chHandle})`,
-          confidence: c.hasRandomSuffix ? 0.72 : 0.84,
-          match_tier: "verified",
-          match_reason: "YouTube channel matches full name",
+          confidence: c.hasRandomSuffix ? 0.72 : ytNameEv.strong ? 0.84 : 0.74,
+          match_tier: ytNameEv.strong ? "verified" : "probable",
+          match_reason: ytNameEv.strong
+            ? "YouTube channel strong name phrase"
+            : "YouTube handle/partial name match",
           skipHandleTrack: c.hasRandomSuffix,
         });
       }
@@ -3500,15 +4075,18 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
           const cleanDesc = decodeHtmlEntities(sig.description);
           if (!cleanTitle || /^(medium|kaggle|youtube|hugging face|dev community)$/i.test(cleanTitle)) continue;
           if (!hasFullNameMatch(`${cleanTitle} ${cleanDesc}`, fullName)) continue;
+          const probeNameEv = nameEvidence(`${cleanTitle} ${cleanDesc}`, fullName);
           recordAccount({
             platform: spec.platform,
             handle: spec.handle,
             url: spec.url,
             title: cleanTitle,
             bio: cleanDesc.slice(0, 180) || `${spec.platform} profile confirmed for ${fullName}`,
-            confidence: 0.84,
-            match_tier: "verified",
-            match_reason: `${spec.platform} direct HTML confirmed full name`,
+            confidence: probeNameEv.strong ? 0.84 : 0.74,
+            match_tier: probeNameEv.strong ? "verified" : "probable",
+            match_reason: probeNameEv.strong
+              ? `${spec.platform} direct HTML strong name phrase`
+              : `${spec.platform} direct HTML name proximity/weak match`,
           });
         } catch {
           // ignore unreachable
@@ -3573,13 +4151,17 @@ async function discoverSocialAndWeb(fullName, netCtx, depthLevel = 2, rankedHand
         const ownedSocial = sharesNameToken(acc.handle, fullName) || hasFullNameMatch(item.title, fullName);
         if (!ownedSocial) continue;
         seenUrls.add(item.url);
+        // G1: a search snippet is never enough for `verified` unless the title holds a strong phrase.
+        const socialNameEv = nameEvidence(`${item.title || ""} ${item.snippet || ""}`, fullName);
         const added = recordAccount({
           ...acc,
           title: item.title,
           bio: item.snippet,
-          confidence: 0.85,
-          match_tier: "verified",
-          match_reason: `${acc.platform} profile confirmed via ${engId}`,
+          confidence: socialNameEv.strong ? 0.85 : 0.72,
+          match_tier: socialNameEv.strong ? "verified" : "probable",
+          match_reason: socialNameEv.strong
+            ? `${acc.platform} profile strong name phrase via ${engId}`
+            : `${acc.platform} handle/partial name via ${engId}`,
         });
         if (added) engineHits++;
         continue;
@@ -4005,24 +4587,59 @@ async function discoverPasteAndLeakMentions(fullName, knownEmails, knownHandles,
 }
 
 /**
+ * ONION-3: resolve the configured base origin for an onion engine from
+ * `state.config.custom_onion_seeds` (templates with `{query}` or plain URLs),
+ * falling back to the built-in v3 mirrors.
+ */
+function getConfiguredOnionBase(engine) {
+  const seeds = Array.isArray(state.config?.custom_onion_seeds)
+    ? state.config.custom_onion_seeds
+    : [];
+  const isAhmia = engine === "ahmia";
+  const matches = isAhmia
+    ? [
+        (host) => host.includes("ahmia"),
+        (host) => host.includes("juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd"),
+      ]
+    : [
+        (host) => host.includes("3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad"),
+        (host) => host.includes("onionland"),
+      ];
+  for (const seed of seeds) {
+    if (typeof seed !== "string" || !seed.trim()) continue;
+    try {
+      const u = new URL(seed.replace(/\{query\}/g, "x"));
+      const host = u.hostname.toLowerCase();
+      if (matches.some((m) => m(host))) return u.origin;
+    } catch {
+      // ignore malformed seed template
+    }
+  }
+  return isAhmia ? AHMIA_V3_BASE : ONIONLAND_V3_BASE;
+}
+
+/**
  * Real Ahmia v3 .onion parser over Tor SOCKS5h (with clean https://ahmia.fi over-Tor fallback):
  * Quotes multi-word names accurately, grabs rotating hidden form token + cookie,
  * and parses `<li class="result">` items cleanly.
  */
-async function queryAhmiaOnion(torHost, torPort, rawQuery) {
-  const hits = [];
+async function queryAhmiaOnion(torHost, torPort, rawQuery, stats = null) {
   const cleanQuery = String(rawQuery || "").replace(/^["']+|["']+$/g, "").trim();
-  if (!cleanQuery) return hits;
+  if (!cleanQuery) return [];
   const formattedQuery = /\s/.test(cleanQuery) ? `"${cleanQuery}"` : cleanQuery;
+  const ahmiaBase = getConfiguredOnionBase("ahmia");
 
-  const queryBase = async (baseUrl, engineLabel) => {
+  const queryBase = async (baseUrl, engineLabel, timeoutMs, socksUser) => {
+    const hits = [];
+    let clean = false;
     try {
       const home = await socks5hRequest(torHost, torPort, `${baseUrl}/`, {
-        timeoutMs: 14000,
+        timeoutMs,
         maxBytes: 90_000,
         jitter: false,
+        socksUser,
       });
-      if (!home.ok) return;
+      if (!home.ok) return { hits, clean };
       const homeHtml = await home.text();
       const hm = homeHtml.match(/<input[^>]+type=["']hidden["'][^>]+name=["']([^"']+)["'][^>]+value=["']([^"']+)["']/i);
       const cookie = home.headers.get("set-cookie")?.split(";")[0] || null;
@@ -4031,12 +4648,14 @@ async function queryAhmiaOnion(torHost, torPort, rawQuery) {
         : `${baseUrl}/search/?q=${encodeURIComponent(formattedQuery)}`;
 
       const res = await socks5hRequest(torHost, torPort, searchUrl, {
-        timeoutMs: 16000,
+        timeoutMs,
         maxBytes: 750_000,
         jitter: false,
+        socksUser,
         headers: cookie ? { Cookie: cookie } : {},
       });
-      if (!res.ok) return;
+      if (!res.ok) return { hits, clean };
+      clean = true;
       const html = await res.text();
       const lis = html.match(/<li class="result"[\s\S]*?<\/li>/gi) || [];
       for (const li of lis.slice(0, 15)) {
@@ -4071,13 +4690,29 @@ async function queryAhmiaOnion(torHost, torPort, rawQuery) {
     } catch {
       // ignore Tor circuit timeout
     }
+    return { hits, clean };
   };
 
-  await queryBase(AHMIA_V3_BASE, "Ahmia v3");
-  if (hits.length === 0) {
-    await queryBase("https://ahmia.fi", "Ahmia Mirror (Tor)");
+  // Two attempts, each on a fresh Tor circuit (IsolateSOCKSAuth via socksUser):
+  // a cold rendezvous routinely exceeds one short timeout, and returning an empty
+  // array on the first slow hop silently hides every .onion hit.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const timeoutMs = attempt === 0 ? 25000 : 20000;
+    const socksUser = `tauf-onion-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (stats) stats.attempts = (stats.attempts || 0) + 1;
+
+    const primary = await queryBase(ahmiaBase, "Ahmia v3", timeoutMs, socksUser);
+    const hits = [...primary.hits];
+    let clean = primary.clean;
+    if (hits.length === 0) {
+      const mirror = await queryBase("https://ahmia.fi", "Ahmia Mirror (Tor)", timeoutMs, socksUser);
+      hits.push(...mirror.hits);
+      clean = clean || mirror.clean;
+    }
+    if (hits.length > 0 || clean) return hits;
+    if (stats) stats.reason = `ahmia attempt ${attempt + 1} failed`;
   }
-  return hits;
+  return [];
 }
 
 /**
@@ -4085,46 +4720,65 @@ async function queryAhmiaOnion(torHost, torPort, rawQuery) {
  * Quotes multi-word names and parses organic `<div class="result-block">` items while skipping sponsored ads.
  */
 async function queryOnionLand(torHost, torPort, rawQuery, stats = null) {
-  const hits = [];
   const cleanQuery = String(rawQuery || "").replace(/^["']+|["']+$/g, "").trim();
-  if (!cleanQuery) return hits;
+  if (!cleanQuery) return [];
   const formattedQuery = /\s/.test(cleanQuery) ? `"${cleanQuery}"` : cleanQuery;
-  try {
-    const searchUrl = `${ONIONLAND_V3_BASE}/search?q=${encodeURIComponent(formattedQuery)}`;
-    const res = await socks5hRequest(torHost, torPort, searchUrl, {
-      timeoutMs: 16000,
-      maxBytes: 450_000,
-      jitter: false,
-    });
-    if (!res.ok) return hits;
-    const html = await res.text();
-    const blocks = html.split(/<div class="result-block">/i).slice(1);
-    for (const blk of blocks) {
-      if (/sponsored|\/ads\/click/i.test(blk.slice(0, 450))) {
-        if (stats) stats.adsFiltered++;
-        continue;
-      }
-      const tM = blk.match(/<div class="title"[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
-      const lM = blk.match(/<div class="link"[^>]*>([\s\S]*?)<\/div>/i);
-      const dM = blk.match(/<div class="desc"[^>]*>([\s\S]*?)<\/div>/i);
-      let onionUrl = lM ? decodeHtmlEntities(lM[1].replace(/<[^>]+>/g, "")) : "";
-      if (!onionUrl || !onionUrl.includes(".onion")) continue;
-      if (!onionUrl.startsWith("http")) onionUrl = `http://${onionUrl}`;
-      const title = tM ? decodeHtmlEntities(tM[1].replace(/<[^>]+>/g, " ")) : onionUrl;
-      const snippet = dM ? decodeHtmlEntities(dM[1].replace(/<[^>]+>/g, " ")) : "";
-      hits.push({
-        engine: "OnionLand v3",
-        query: cleanQuery,
-        title: title.slice(0, 120),
-        url: onionUrl,
-        snippet: snippet.slice(0, 260),
+  const onionLandBase = getConfiguredOnionBase("onionland");
+
+  const queryOnce = async (timeoutMs, socksUser) => {
+    const hits = [];
+    let clean = false;
+    try {
+      const searchUrl = `${onionLandBase}/search?q=${encodeURIComponent(formattedQuery)}`;
+      const res = await socks5hRequest(torHost, torPort, searchUrl, {
+        timeoutMs,
+        maxBytes: 450_000,
+        jitter: false,
+        socksUser,
       });
-      if (hits.length >= 8) break;
+      if (!res.ok) return { hits, clean };
+      clean = true;
+      const html = await res.text();
+      const blocks = html.split(/<div class="result-block">/i).slice(1);
+      for (const blk of blocks) {
+        if (/sponsored|\/ads\/click/i.test(blk.slice(0, 450))) {
+          if (stats) stats.adsFiltered++;
+          continue;
+        }
+        const tM = blk.match(/<div class="title"[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
+        const lM = blk.match(/<div class="link"[^>]*>([\s\S]*?)<\/div>/i);
+        const dM = blk.match(/<div class="desc"[^>]*>([\s\S]*?)<\/div>/i);
+        let onionUrl = lM ? decodeHtmlEntities(lM[1].replace(/<[^>]+>/g, "")) : "";
+        if (!onionUrl || !onionUrl.includes(".onion")) continue;
+        if (!onionUrl.startsWith("http")) onionUrl = `http://${onionUrl}`;
+        const title = tM ? decodeHtmlEntities(tM[1].replace(/<[^>]+>/g, " ")) : onionUrl;
+        const snippet = dM ? decodeHtmlEntities(dM[1].replace(/<[^>]+>/g, " ")) : "";
+        hits.push({
+          engine: "OnionLand v3",
+          query: cleanQuery,
+          title: title.slice(0, 120),
+          url: onionUrl,
+          snippet: snippet.slice(0, 260),
+        });
+        if (hits.length >= 8) break;
+      }
+    } catch {
+      // ignore timeout
     }
-  } catch {
-    // ignore timeout
+    return { hits, clean };
+  };
+
+  // Two attempts on fresh Tor circuits (IsolateSOCKSAuth); 25 s then 20 s — a single
+  // cold rendezvous below that budget produced silent 0-hit results.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const timeoutMs = attempt === 0 ? 25000 : 20000;
+    const socksUser = `tauf-onion-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (stats) stats.attempts = (stats.attempts || 0) + 1;
+    const result = await queryOnce(timeoutMs, socksUser);
+    if (result.hits.length > 0 || result.clean) return result.hits;
+    if (stats) stats.reason = `onionland attempt ${attempt + 1} failed`;
   }
-  return hits;
+  return [];
 }
 
 /**
@@ -4295,7 +4949,7 @@ function classifyOnionHit(hit, query, queryType, fullName, livePageData = null) 
       return null;
     }
   } else if (qType === "full_name") {
-    if (hasExactPhraseProximity(combinedCorpus, fullName)) {
+    if (nameEvidence(combinedCorpus, fullName).strong) {
       match_precision = "exact";
       match_tier = "verified";
       confidence = isLive ? 0.89 : 0.84;
@@ -4369,8 +5023,10 @@ async function runInvestigation(caseId, input, auth) {
 
   state.activeInvestigations++;
   cancelIdleShutdown();
+  // Hoisted so the catch/finally below can report elapsed time and depth level.
   const startedMs = Date.now();
   const depthLevel = Math.max(1, Math.min(4, Number(input.depth_level || 2)));
+  try {
   const estTotalSec = { 1: 22, 2: 65, 3: 115, 4: 185 }[depthLevel] || 65;
 
   const emitStage = (stage, message, progress) => {
@@ -4397,14 +5053,22 @@ async function runInvestigation(caseId, input, auth) {
     snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
     broadcastEvent({ kind: "tool_status", case_id: caseId, ...status });
   };
+  const isQuarantinedNodeId = (id) =>
+    snap.nodes.some((n) => n.id === id && n.status === "quarantined");
   const addNode = (node) => {
-    const merged = upsertNode(snap, node);
+    // G2 / ACC-2: collision accounts never enter the connected graph.
+    const next = { ...node };
+    if (next.kind === "account" && next.metadata?.match_tier === "collision") {
+      next.status = "quarantined";
+    }
+    const merged = upsertNode(snap, next);
     snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
     broadcastEvent({ kind: "node", case_id: caseId, node: merged });
     return merged;
   };
   const addEdge = (source, target, relation, confidence, tool) => {
     if (!source || !target || source === target) return;
+    if (isQuarantinedNodeId(source) || isQuarantinedNodeId(target)) return;
     const edge = upsertEdge(snap, {
       id: `${source}__${relation}__${target}`,
       source,
@@ -4416,6 +5080,7 @@ async function runInvestigation(caseId, input, auth) {
     broadcastEvent({ kind: "edge", case_id: caseId, edge });
   };
   const addFinding = (finding) => {
+    if (finding?.node_id && isQuarantinedNodeId(finding.node_id)) return;
     const merged = upsertFinding(snap, finding);
     snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
     broadcastEvent({ kind: "finding", case_id: caseId, finding: merged });
@@ -4428,36 +5093,16 @@ async function runInvestigation(caseId, input, auth) {
   // -------------------------------------------------------------------------
   // Network Anonymity Setup & Fail-Closed Guard
   // -------------------------------------------------------------------------
-  const tor = await detectLocalTor(auth.tor_socks_url);
-  const customProxy = auth.proxy_url?.trim() ? ensureSocks5h(auth.proxy_url) : null;
-  let proxyHost = null;
-  let proxyPort = null;
-  let torEndpoint = null;
-
-  if (tor.available && (input.enable_tor || input.strict_anonymity !== false)) {
-    proxyHost = tor.host;
-    proxyPort = tor.port;
-    torEndpoint = tor.endpoint;
-  } else if (customProxy) {
-    try {
-      const pu = new URL(customProxy);
-      proxyHost = pu.hostname;
-      proxyPort = Number(pu.port) || 1080;
-      torEndpoint = customProxy;
-    } catch {
-      // invalid proxy
-    }
-  }
-
-  const strictAnonymity =
-    typeof input.strict_anonymity === "boolean" ? input.strict_anonymity : Boolean(tor.available);
-
-  const netCtx = {
-    strictAnonymity,
-    proxyHost,
-    proxyPort,
-    torEndpoint,
-    anonymityMode: tor.available && proxyHost ? "tor_socks5h" : proxyHost ? "custom_proxy" : "direct",
+  const netCtx = await resolveNetContext(auth, input);
+  const { strictAnonymity, proxyHost, torEndpoint } = netCtx;
+  // Compatibility view for the dark-web stage. Only a real Tor circuit can resolve
+  // `.onion` hosts, so `available` is true only when we resolved through Tor (not a
+  // generic custom SOCKS proxy).
+  const tor = {
+    available: Boolean(netCtx.proxyHost) && netCtx.anonymityMode === "tor_socks5h",
+    host: netCtx.proxyHost,
+    port: netCtx.proxyPort,
+    endpoint: netCtx.torEndpoint,
   };
 
   emitStage(
@@ -4498,7 +5143,7 @@ async function runInvestigation(caseId, input, auth) {
       "Fail-closed: Strict Anonymity is ON but local Tor SOCKS5h is offline — refused clearnet egress to protect your IP"
     );
     const localCorpusDir = auth.local_corpus_dir?.trim() || DEFAULT_CORPUS_DIR;
-    const { filesScanned, hits } = scanLocalCorpus(localCorpusDir, [fullName, ...(input.email ? [input.email] : [])]);
+    const { filesScanned, hits } = await scanLocalCorpus(localCorpusDir, [fullName, ...(input.email ? [input.email] : [])]);
     emitTool(
       "local-corpus",
       "done",
@@ -4513,8 +5158,6 @@ async function runInvestigation(caseId, input, auth) {
       100
     );
     broadcastEvent({ kind: "completed", case_id: caseId, summary: snap.stats });
-    state.activeInvestigations = Math.max(0, state.activeInvestigations - 1);
-    scheduleIdleShutdownIfNeeded();
     return;
   }
 
@@ -4541,8 +5184,12 @@ async function runInvestigation(caseId, input, auth) {
     return false;
   };
 
-  const trackEmail = (em) => {
+  // G4 / ACC-5: generated/guessed addresses are never identity anchors. They are not
+  // added to `knownEmails` (and therefore never become holehe/ignorant parents) unless
+  // the same address was independently discovered from a verified source.
+  const trackEmail = (em, opts = {}) => {
     const c = String(em || "").trim().toLowerCase();
+    if (opts.generated === true) return false;
     if (c && !isNoiseEmail(c) && !seenEmails.has(c)) {
       seenEmails.add(c);
       knownEmails.push(c);
@@ -4714,6 +5361,14 @@ async function runInvestigation(caseId, input, auth) {
   for (const dom of knownDomains) {
     permutedEmails.push(...generateCorporateEmails(fullName, dom, input.email));
   }
+  // G4 / ACC-5: everything generated by the permutator (except a user-provided address)
+  // is a guess. Tag it so Gravatar existence can never make it a verified anchor.
+  const providedEmailLower = String(input.email || "").trim().toLowerCase();
+  const generatedEmailSet = new Set(
+    permutedEmails
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => e && e !== providedEmailLower)
+  );
   emitTool(
     "permutator",
     "done",
@@ -4871,6 +5526,8 @@ async function runInvestigation(caseId, input, auth) {
     const recType =
       rec.record_type ||
       inferRecordType(rec.url, rec.title, rec.snippet, rec.source === "YouTube Media" ? "Media / Talk" : "Public Web Record");
+    // G1: only a strong name phrase earns `verified`; proximity/weak stays `probable`.
+    const recNameEv = nameEvidence(`${rec.title || ""} ${rec.snippet || ""}`, fullName);
     addNode({
       id: recId,
       kind: "record",
@@ -4884,8 +5541,10 @@ async function runInvestigation(caseId, input, auth) {
         source: rec.source,
         record_type: recType,
         bio: rec.snippet,
-        match_tier: "verified",
-        match_reason: `${rec.source} match for full name`,
+        match_tier: recNameEv.strong ? "verified" : "probable",
+        match_reason: recNameEv.strong
+          ? `${rec.source} strong name phrase match`
+          : `${rec.source} name proximity/weak match`,
       },
       url: rec.url,
       depth: 1,
@@ -4921,6 +5580,7 @@ async function runInvestigation(caseId, input, auth) {
       const dom = new URL(u).hostname.replace(/^www\./, "").toLowerCase();
       let parentId = srcUrl ? normalizeNodeId("record", srcUrl) : normalizeNodeId("record", u);
       if (!srcUrl && !snap.nodes.some((n) => n.id === parentId)) {
+        const siteNameEv = nameEvidence(`${wTitle || ""} ${wSnippet || ""}`, fullName);
         addNode({
           id: parentId,
           kind: "record",
@@ -4934,8 +5594,10 @@ async function runInvestigation(caseId, input, auth) {
             source: dom,
             record_type: "Personal / Company Website",
             bio: wSnippet || `Personal or company website linked to ${fullName}`,
-            match_tier: "verified",
-            match_reason: `${dom} website matched full name`,
+            match_tier: siteNameEv.strong ? "verified" : "probable",
+            match_reason: siteNameEv.strong
+              ? `${dom} website strong name phrase match`
+              : `${dom} website name proximity/weak match`,
           },
           url: u,
           depth: 1,
@@ -5012,6 +5674,8 @@ async function runInvestigation(caseId, input, auth) {
   for (const rec of pubRecordsRes.records) {
     const recId = normalizeNodeId("record", rec.url);
     const recType = rec.record_type || inferRecordType(rec.url, rec.title, rec.snippet, "Public Web Record");
+    // G1: CourtListener / arXiv / IndianKanoon / Startpage records — verified needs a strong phrase.
+    const pubRecNameEv = nameEvidence(`${rec.title || ""} ${rec.snippet || ""}`, fullName);
     addNode({
       id: recId,
       kind: "record",
@@ -5025,8 +5689,10 @@ async function runInvestigation(caseId, input, auth) {
         source: rec.source,
         record_type: recType,
         bio: rec.snippet,
-        match_tier: "verified",
-        match_reason: `${rec.source} public record`,
+        match_tier: pubRecNameEv.strong ? "verified" : "probable",
+        match_reason: pubRecNameEv.strong
+          ? `${rec.source} strong name phrase match`
+          : `${rec.source} name proximity/weak match`,
       },
       url: rec.url,
       depth: 1,
@@ -5074,7 +5740,7 @@ async function runInvestigation(caseId, input, auth) {
         const shortKey = rec.key_id.slice(-16);
         const pgpId = normalizeNodeId("pgp_key", rec.key_id);
         const keyUrl = `https://keyserver.ubuntu.com/pks/lookup?search=0x${rec.key_id}&fingerprint=on&op=index`;
-        const exactName = rec.uids.some((u) => hasFullNameMatch(u.raw_uid, fullName));
+        const exactName = rec.uids.some((u) => nameEvidence(u.raw_uid, fullName).strong);
         const keyConf = exactName ? 0.88 : 0.72;
 
         // Branch from matching existing email anchor if available, else seedId
@@ -5208,6 +5874,8 @@ async function runInvestigation(caseId, input, auth) {
       const hHubId = normalizeNodeId("handle", h);
       const hasHub = snap.nodes.some((n) => n.id === hHubId);
       const fullMatch = hasFullNameMatch(`${prof.display_name || ""} ${prof.bio || ""}`, fullName);
+      const ghNameEv = nameEvidence(`${prof.display_name || ""} ${prof.bio || ""}`, fullName);
+      const nameConfirmed = ghNameEv.strong || ghNameEv.proximity;
       const matchingPatchEmails = prof.patch_emails.filter(
         (pe) =>
           hasFullNameMatch(pe.author_name, fullName) ||
@@ -5223,17 +5891,19 @@ async function runInvestigation(caseId, input, auth) {
       const hasCrypto = matchingGpgEmails.length > 0 || matchingPatchEmails.length > 0;
       const matchTier = hasCrypto
         ? "verified"
-        : fullMatch || isSeed
+        : nameConfirmed || isSeed
         ? "probable"
         : "collision";
       const matchReason = hasCrypto
         ? "Git .patch/.gpg cryptographic proof"
-        : fullMatch
-        ? "Full name confirmed in GitHub bio"
+        : ghNameEv.strong
+        ? "Full name phrase confirmed in GitHub bio"
+        : ghNameEv.proximity
+        ? "Name tokens in proximity in GitHub bio"
         : isSeed
         ? "Exact provided handle match"
         : "Handle match only — collision risk";
-      const conf = hasCrypto ? 0.92 : fullMatch ? 0.78 : isSeed ? 0.72 : 0.38;
+      const conf = hasCrypto ? 0.92 : nameConfirmed ? 0.78 : isSeed ? 0.72 : 0.38;
 
       if (matchTier !== "collision" && !confirmedHandlesPriority.includes(h)) {
         confirmedHandlesPriority.push(h);
@@ -5537,14 +6207,20 @@ async function runInvestigation(caseId, input, auth) {
         const hHubId = normalizeNodeId("handle", h);
         const hasHub = snap.nodes.some((n) => n.id === hHubId);
         const fullMatch = hasFullNameMatch(gl.display_name || "", fullName);
+        const glNameEv = nameEvidence(gl.display_name || "", fullName);
+        const glNameConfirmed = glNameEv.strong || glNameEv.proximity;
         const isGlSeed = seedHandleNorm === h;
         const matchingGlGpgEmails = gl.gpg_emails.filter(
           (em) =>
             hasFullNameMatch(em, fullName) ||
             ((fullMatch || isGlSeed) && !authorConflictsFirstName(String(em || "").split("@")[0]))
         );
-        const tier = matchingGlGpgEmails.length ? "verified" : fullMatch || isGlSeed ? "probable" : "collision";
-        const glConf = matchingGlGpgEmails.length ? 0.9 : fullMatch ? 0.74 : isGlSeed ? 0.7 : 0.38;
+        const tier = matchingGlGpgEmails.length
+          ? "verified"
+          : glNameConfirmed || isGlSeed
+          ? "probable"
+          : "collision";
+        const glConf = matchingGlGpgEmails.length ? 0.9 : glNameConfirmed ? 0.74 : isGlSeed ? 0.7 : 0.38;
         const glDepth = hasHub ? findNodeDepth(hHubId) + 1 : 1;
         addNode({
           id: glId,
@@ -5561,8 +6237,10 @@ async function runInvestigation(caseId, input, auth) {
             match_tier: tier,
             match_reason: matchingGlGpgEmails.length
               ? "GitLab raw .gpg UID"
-              : fullMatch
-              ? "Full name confirmed on GitLab"
+              : glNameEv.strong
+              ? "Full name phrase confirmed on GitLab"
+              : glNameEv.proximity
+              ? "Name tokens in proximity on GitLab"
               : isGlSeed
               ? "Exact provided handle match"
               : "Handle match only — collision risk",
@@ -5754,24 +6432,28 @@ async function runInvestigation(caseId, input, auth) {
         if (!g) continue;
         const gravHash = await computeAvatarSha256(g.avatarUrl, netCtx);
         const avatarMatched = Boolean(gravHash && knownAvatarHashes.has(gravHash));
-        const conf = avatarMatched ? 0.95 : 0.68;
-        const tier = avatarMatched ? "verified" : "probable";
+        // G4/G2: a generated address from Gravatar existence (even with an avatar match)
+        // is never an identity anchor — cap at `probable` and never track it as known.
+        const conf = avatarMatched ? 0.78 : 0.68;
+        const tier = "probable";
         const reason = avatarMatched
-          ? "Gravatar avatar SHA-256 matches profile"
-          : "Passive Gravatar MD5 hash exists";
+          ? "Gravatar avatar SHA-256 matches profile (avatar is a clue, not identity proof)"
+          : "Passive Gravatar MD5 hash exists for a generated address";
         const emId = normalizeNodeId("email", candEmail);
         addNode({
           id: emId,
           kind: "email",
           label: candEmail,
-          sublabel: avatarMatched ? "Verified via Avatar SHA-256" : "Probable Gravatar Email",
-          layer: avatarMatched ? "anchor" : "surface",
+          sublabel: avatarMatched ? "Probable via Avatar SHA-256" : "Probable Gravatar Email",
+          layer: "surface",
           confidence: conf,
           status: "unverified",
           sources: ["gravatar-raw"],
           metadata: {
             gravatar_md5: g.md5,
             avatar_url: g.avatarUrl,
+            generated: true,
+            ...(avatarMatched ? { corroborated_by_avatar: true } : {}),
             ...(gravHash ? { avatar_sha256: gravHash.slice(0, 16) } : {}),
             match_tier: tier,
             match_reason: reason,
@@ -5785,21 +6467,21 @@ async function runInvestigation(caseId, input, auth) {
         addFinding({
           id: `finding:gravatar-discovery:${candEmail}`,
           node_id: emId,
-          title: `${avatarMatched ? "Verified" : "Probable"} Email via Passive Gravatar: ${candEmail}`,
+          title: `Probable Email via Passive Gravatar: ${candEmail}`,
           category: "anchor",
-          severity: avatarMatched ? "high" : "low",
+          severity: "low",
           confidence: conf,
-          consensus_count: avatarMatched ? 2 : 1,
+          consensus_count: 1,
           sources: avatarMatched ? ["gravatar-raw", "avatar-corroborator"] : ["gravatar-raw"],
           summary: avatarMatched
-            ? `Passive Gravatar MD5 HEAD confirmed ${candEmail} AND its avatar SHA-256 matched a discovered profile avatar byte-for-byte.`
-            : `Passive Gravatar MD5 HEAD returned HTTP 200 for ${candEmail} (zero alert, zero API).`,
+            ? `Passive Gravatar MD5 HEAD returned HTTP 200 for generated address ${candEmail} AND its avatar SHA-256 matched a discovered profile avatar. Avatar match alone does not prove identity.`
+            : `Passive Gravatar MD5 HEAD returned HTTP 200 for generated address ${candEmail} (zero alert, zero API). Generated address — not an anchor.`,
           pivot_trail: [`Name: ${fullName}`, `Gravatar Raw MD5 -> ${candEmail}`],
           url: g.avatarUrl,
           timestamp: now,
           sensitive_fields: [candEmail, g.md5],
         });
-        trackEmail(candEmail);
+        trackEmail(candEmail, { generated: true });
       }
     }
   }
@@ -5874,43 +6556,49 @@ async function runInvestigation(caseId, input, auth) {
     const g = await checkGravatarRawHash(em, netCtx);
     if (g) {
       const emId = normalizeNodeId("email", em);
+      // G4 / ACC-5: Gravatar existence alone is not identity proof — cap at `probable`.
+      const isGenerated = !knownEmails.includes(em) || generatedEmailSet.has(em);
+      const conf = isGenerated ? 0.68 : 0.74;
       addNode({
         id: emId,
         kind: "email",
         label: em,
-        sublabel: "Gravatar Hash Confirmed",
-        layer: "anchor",
-        confidence: 0.88,
+        sublabel: isGenerated ? "Probable Gravatar (Generated)" : "Probable Gravatar Email",
+        layer: "surface",
+        confidence: conf,
         status: "unverified",
         sources: ["gravatar-raw"],
         metadata: {
           gravatar_md5: g.md5,
           avatar_url: g.avatarUrl,
-          match_tier: "verified",
-          match_reason: "Gravatar MD5 hash confirmed",
+          ...(isGenerated ? { generated: true } : {}),
+          match_tier: "probable",
+          match_reason: isGenerated
+            ? "Gravatar MD5 exists for a generated address (not identity proof)"
+            : "Gravatar MD5 hash exists (not identity proof)",
         },
         url: g.avatarUrl,
         depth: 1,
       });
       if (!hasParentEdge(emId)) {
-        addEdge(seedId, emId, "gravatar_confirmed", 0.88, "gravatar-raw");
+        addEdge(seedId, emId, "gravatar_confirmed", conf, "gravatar-raw");
       }
       addFinding({
         id: `finding:gravatar:${em}`,
         node_id: emId,
-        title: `Active Gravatar Avatar Confirmed for ${em}`,
+        title: `Gravatar MD5 Exists for ${em}`,
         category: "anchor",
-        severity: "medium",
-        confidence: 0.88,
+        severity: "low",
+        confidence: conf,
         consensus_count: 1,
         sources: ["gravatar-raw"],
-        summary: `Direct HEAD check against Gravatar MD5 hash (${g.md5.slice(0, 12)}) returned HTTP 200.`,
+        summary: `Direct HEAD check against Gravatar MD5 hash (${g.md5.slice(0, 12)}) returned HTTP 200. Existence only — not an identity anchor.`,
         pivot_trail: [`Name: ${fullName}`, `Email -> ${em}`, "Gravatar Raw MD5 HEAD -> 200 OK"],
         url: g.avatarUrl,
         timestamp: now,
         sensitive_fields: [em, g.md5],
       });
-      trackEmail(em);
+      trackEmail(em, { generated: isGenerated });
       dnsGravHits++;
     }
   }
@@ -6105,20 +6793,27 @@ async function runInvestigation(caseId, input, auth) {
       for (let i = 0; i < group.length; i++) {
         const g = group[i];
         const existing = snap.nodes.find((n) => n.id === g.nodeId);
-        if (existing) {
-          addNode({
-            ...existing,
-            layer: "anchor",
-            confidence: 0.94,
-            sources: ["avatar-corroborator"],
-            metadata: {
-              ...existing.metadata,
-              avatar_sha256: hash.slice(0, 16),
-              match_tier: "verified",
-              match_reason: `Identical avatar across ${group.length} sites`,
-            },
-          });
-        }
+        if (!existing || existing.status === "quarantined") continue;
+        // G2 / ACC-2: avatar match is a clue, never identity proof on its own.
+        const strongName = nameEvidence(
+          `${existing.metadata?.display_name || ""} ${existing.metadata?.bio || ""} ${existing.label || ""}`,
+          fullName
+        ).strong;
+        addNode({
+          ...existing,
+          layer: strongName ? "anchor" : existing.layer,
+          confidence: strongName ? 0.94 : Math.min(existing.confidence || 0.7, 0.76),
+          sources: ["avatar-corroborator"],
+          metadata: {
+            ...existing.metadata,
+            avatar_sha256: hash.slice(0, 16),
+            corroborated_by_avatar: true,
+            match_tier: strongName ? "verified" : "probable",
+            match_reason: strongName
+              ? `Identical avatar across ${group.length} sites + strong name evidence`
+              : `Identical avatar across ${group.length} sites (avatar clue; name not strong)`,
+          },
+        });
         if (i > 0 && group[0].nodeId !== g.nodeId) {
           addEdge(group[0].nodeId, g.nodeId, "avatar_match", 0.94, "avatar-corroborator");
         }
@@ -6126,13 +6821,13 @@ async function runInvestigation(caseId, input, auth) {
       addFinding({
         id: `finding:avatar-match:${hash.slice(0, 16)}`,
         node_id: group[0].nodeId,
-        title: `Identical Avatar Verified Across ${group.length} Platforms (${sites})`,
+        title: `Identical Avatar Across ${group.length} Platforms (${sites})`,
         category: "anchor",
-        severity: "medium",
-        confidence: 0.94,
+        severity: "low",
+        confidence: 0.76,
         consensus_count: group.length,
         sources: ["avatar-corroborator", "wmn-native"],
-        summary: `SHA-256 avatar fingerprint (${hash.slice(0, 16)}…) matched byte-for-byte across ${sites}, cryptographically linking these accounts beyond username similarity.`,
+        summary: `SHA-256 avatar fingerprint (${hash.slice(0, 16)}…) matched byte-for-byte across ${sites}. Avatar reuse is a corroborating clue, not by itself proof of identity.`,
         pivot_trail: [`Name: ${fullName}`, `Avatar SHA-256 -> ${sites}`],
         url: group[0].url,
         timestamp: now,
@@ -6153,19 +6848,18 @@ async function runInvestigation(caseId, input, auth) {
           addEdge(a.nodeId, b.nodeId, "reciprocal_proof", 0.97, "reciprocal-proof");
           for (const g of [a, b]) {
             const ex = snap.nodes.find((n) => n.id === g.nodeId);
-            if (ex) {
-              addNode({
-                ...ex,
-                layer: "anchor",
-                confidence: 0.97,
-                sources: ["reciprocal-proof"],
-                metadata: {
-                  ...ex.metadata,
-                  match_tier: "verified",
-                  match_reason: "Reciprocal profile link",
-                },
-              });
-            }
+            if (!ex || ex.status === "quarantined") continue;
+            addNode({
+              ...ex,
+              layer: "anchor",
+              confidence: 0.97,
+              sources: ["reciprocal-proof"],
+              metadata: {
+                ...ex.metadata,
+                match_tier: "verified",
+                match_reason: "Reciprocal profile link",
+              },
+            });
           }
           addFinding({
             id: `finding:reciprocal:${a.nodeId}:${b.nodeId}`,
@@ -6665,7 +7359,7 @@ async function runInvestigation(caseId, input, auth) {
 
       for (const qObj of queriesToRun) {
         const [ahmiaHits, olHits] = await Promise.all([
-          queryAhmiaOnion(tor.host, tor.port, qObj.query),
+          queryAhmiaOnion(tor.host, tor.port, qObj.query, darkStats),
           queryOnionLand(tor.host, tor.port, qObj.query, darkStats),
         ]);
         for (const h of [...ahmiaHits, ...olHits]) {
@@ -6715,7 +7409,13 @@ async function runInvestigation(caseId, input, auth) {
         const parentId =
           emParentId && snap.nodes.some((n) => n.id === emParentId) ? emParentId : seedId;
         const pDepth = findNodeDepth(parentId) + 1;
-        const conf = p.queryType === "email" ? 0.88 : 0.8;
+        // G1: an exact email is strong; for name queries require a strong phrase for verified.
+        const pasteNameEv =
+          p.queryType === "email"
+            ? null
+            : nameEvidence(`${p.title || ""} ${p.snippet || ""}`, fullName);
+        const conf =
+          p.queryType === "email" ? 0.88 : pasteNameEv?.strong ? 0.8 : 0.66;
         addNode({
           id: pasteId,
           kind: "paste",
@@ -6730,8 +7430,14 @@ async function runInvestigation(caseId, input, auth) {
             matched_term: p.matchedTerm,
             matched_identifier: p.queryType === "email" ? `Email: ${p.matchedTerm}` : `Full Name: ${p.matchedTerm}`,
             bio: p.snippet,
-            match_tier: "verified",
-            match_reason: `Public paste/leak mention on ${p.host}`,
+            match_tier:
+              p.queryType === "email" ? "verified" : pasteNameEv?.strong ? "verified" : "probable",
+            match_reason:
+              p.queryType === "email"
+                ? `Public paste/leak exact email on ${p.host}`
+                : pasteNameEv?.strong
+                ? `Public paste/leak strong name phrase on ${p.host}`
+                : `Public paste/leak name proximity/weak match on ${p.host}`,
           },
           url: p.url,
           depth: pDepth,
@@ -6776,7 +7482,7 @@ async function runInvestigation(caseId, input, auth) {
   const corpusDir = auth.local_corpus_dir?.trim() || DEFAULT_CORPUS_DIR;
   emitStage("local_corpus", "Scanning local offline breach/paste corpus folder", 89);
   emitTool("local-corpus", "running", 0, `Scanning ${path.basename(corpusDir)}`);
-  const { filesScanned, hits: corpusHits } = scanLocalCorpus(corpusDir, searchTerms);
+  const { filesScanned, hits: corpusHits } = await scanLocalCorpus(corpusDir, searchTerms);
   for (const hit of corpusHits) {
     const bId = normalizeNodeId("breach", `${hit.file_name}:${hit.matched_term}`);
     const parentId = findAnchorForTerm(hit.matched_term);
@@ -7087,8 +7793,14 @@ async function runInvestigation(caseId, input, auth) {
   persistCases();
   emitStage("completed", "Investigation complete", 100);
   broadcastEvent({ kind: "completed", case_id: caseId, summary: snap.stats });
-  state.activeInvestigations = Math.max(0, state.activeInvestigations - 1);
-  scheduleIdleShutdownIfNeeded();
+  } catch (err) {
+    logRuntime(`[Investigation ${caseId}] failed: ${err && err.message ? err.message : String(err)}`);
+    try { broadcastEvent({ kind: 'stage', case_id: caseId, stage: 'error', message: `Investigation failed: ${err && err.message ? err.message : String(err)}`, progress: 100, elapsed_seconds: Math.round((Date.now()-startedMs)/1000), eta_seconds: 0, depth_level: depthLevel }); } catch {}
+    try { persistCases(); } catch {}
+  } finally {
+    state.activeInvestigations = Math.max(0, state.activeInvestigations - 1);
+    scheduleIdleShutdownIfNeeded();
+  }
 }
 
 async function runDeepenNode(caseId, nodeId) {
@@ -7096,6 +7808,10 @@ async function runDeepenNode(caseId, nodeId) {
   if (!snap) return;
   const node = snap.nodes.find((n) => n.id === nodeId);
   if (!node) return;
+  // LC-2: deepen is a real investigation — count it and block idle shutdown.
+  state.activeInvestigations++;
+  cancelIdleShutdown();
+  try {
   node.status = "confirmed";
   node.metadata = {
     ...(node.metadata || {}),
@@ -7104,22 +7820,41 @@ async function runDeepenNode(caseId, nodeId) {
   };
   broadcastEvent({ kind: "node", case_id: caseId, node });
 
-  const tor = await detectLocalTor(state.config.tor_socks_url);
-  const netCtx = {
-    strictAnonymity: Boolean(snap.input.strict_anonymity),
-    proxyHost: tor.available ? tor.host : null,
-    proxyPort: tor.available ? tor.port : null,
-    torEndpoint: tor.available ? tor.endpoint : null,
-  };
-  if (netCtx.strictAnonymity && !netCtx.proxyHost) return;
+  // PR-2: same proxy resolution as runInvestigation (Tor first, then custom proxy).
+  const netCtx = await resolveNetContext(state.config, snap.input || {});
+  if (netCtx.strictAnonymity && !netCtx.proxyHost) {
+    // Refuse all egress rather than leak the user's IP from a Tor-mode case.
+    broadcastEvent({
+      kind: "stage",
+      case_id: caseId,
+      stage: "error",
+      message:
+        "Deepen refused: Strict Anonymity is ON but local Tor/custom proxy is offline — no egress performed.",
+      progress: 100,
+    });
+    return;
+  }
+
+  const knownOrgs = snap.nodes.filter((n) => n.kind === "org").map((n) => n.label).filter(Boolean).slice(0, 8);
+  const knownDomains = snap.nodes.filter((n) => n.kind === "domain").map((n) => n.label).filter(Boolean).slice(0, 8);
+  const knownEmails = snap.nodes.filter((n) => n.kind === "email").map((n) => n.label).filter(Boolean).slice(0, 8);
+  const seedHandleNorm =
+    String(snap.input?.handle || "").trim().replace(/^@/, "").toLowerCase() || null;
 
   const now = new Date().toISOString();
+  const isQuarantinedNodeId = (id) =>
+    snap.nodes.some((n) => n.id === id && n.status === "quarantined");
   const addNode = (n) => {
-    const m = upsertNode(snap, n);
+    const next = { ...n };
+    if (next.kind === "account" && next.metadata?.match_tier === "collision") {
+      next.status = "quarantined";
+    }
+    const m = upsertNode(snap, next);
     broadcastEvent({ kind: "node", case_id: caseId, node: m });
   };
   const addEdge = (s, t, rel, conf, src) => {
     if (!s || !t || s === t) return;
+    if (isQuarantinedNodeId(s) || isQuarantinedNodeId(t)) return;
     const e = upsertEdge(snap, {
       id: `${s}__${rel}__${t}`,
       source: s,
@@ -7131,6 +7866,7 @@ async function runDeepenNode(caseId, nodeId) {
     broadcastEvent({ kind: "edge", case_id: caseId, edge: e });
   };
   const addFinding = (f) => {
+    if (f?.node_id && isQuarantinedNodeId(f.node_id)) return;
     const m = upsertFinding(snap, f);
     broadcastEvent({ kind: "finding", case_id: caseId, finding: m });
   };
@@ -7155,7 +7891,17 @@ async function runDeepenNode(caseId, nodeId) {
       });
       addEdge(nodeId, emId, "commit_email", 0.94, "deepen-patch");
     }
-    const hits = await runWmnForHandle(h, snap.input.full_name, [], [], [], true, netCtx, 12);
+    // ACC-4: only a genuine seed-handle pivot may use the seed-handle ceiling.
+    const hits = await runWmnForHandle(
+      h,
+      snap.input.full_name,
+      knownOrgs,
+      knownDomains,
+      knownEmails,
+      seedHandleNorm === h.toLowerCase(),
+      netCtx,
+      12
+    );
     for (const hit of hits) {
       const acctId = normalizeAccountNodeId(hit.site_name, hit.handle);
       addNode({
@@ -7237,8 +7983,31 @@ async function runDeepenNode(caseId, nodeId) {
   const seedNode = snap.nodes.find((n) => n.layer === "seed");
   if (seedNode) ensureGraphIntegrity(snap, seedNode.id);
   snap.stats = computeStats(snap.nodes, snap.findings, snap.tool_runs);
-  persistCases();
   broadcastEvent({ kind: "completed", case_id: caseId, summary: snap.stats });
+  } catch (err) {
+    logRuntime(
+      `[Deepen ${caseId}/${nodeId}] failed: ${err && err.message ? err.message : String(err)}`
+    );
+    try {
+      broadcastEvent({
+        kind: "stage",
+        case_id: caseId,
+        stage: "error",
+        message: `Deepen failed: ${err && err.message ? err.message : String(err)}`,
+        progress: 100,
+      });
+    } catch {
+      // ignore broadcast failure
+    }
+  } finally {
+    try {
+      persistCases();
+    } catch {
+      // ignore persistence failure
+    }
+    state.activeInvestigations = Math.max(0, state.activeInvestigations - 1);
+    scheduleIdleShutdownIfNeeded();
+  }
 }
 
 function renderDossierHtml(snap, redact) {
@@ -7256,7 +8025,13 @@ function renderDossierHtml(snap, redact) {
     out = out.replace(/\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, "[REDACTED_EMAIL]");
     return esc(out);
   };
-  const rows = snap.findings
+  // G2 / ACC-2: quarantined nodes and their findings never appear in the dossier.
+  const quarantinedIds = new Set(
+    snap.nodes.filter((n) => n.status === "quarantined").map((n) => n.id)
+  );
+  const dossierFindings = snap.findings.filter((f) => !quarantinedIds.has(f.node_id));
+  const dossierNodeCount = snap.nodes.length - quarantinedIds.size;
+  const rows = dossierFindings
     .map(
       (f) =>
         `<tr><td>${esc(f.severity)}</td><td>${esc(f.category)}</td><td>${mask(
@@ -7272,19 +8047,56 @@ function renderDossierHtml(snap, redact) {
   )}</title><style>body{font-family:"IBM Plex Sans",system-ui,sans-serif;background:#121316;color:#ecece9;padding:36px;max-width:1080px;margin:auto}h1{margin:0 0 8px}p{color:#a1a4ac}table{width:100%;border-collapse:collapse;margin-top:24px;font-size:13px}th,td{border-bottom:1px solid rgba(236,236,233,.1);padding:10px;text-align:left;vertical-align:top}th{color:#d99b38}</style></head><body><h1>TAUF Executive Dossier — ${esc(
     snap.input.full_name
   )}</h1><p>${redact ? "REDACTED BRIEF · " : ""}Generated locally (Zero External APIs) · Nodes: ${
-    snap.nodes.length
-  } · Findings: ${snap.findings.length}</p><table><thead><tr><th>Severity</th><th>Category</th><th>Finding</th><th>Summary</th><th>Sources</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
+    dossierNodeCount
+  } · Findings: ${dossierFindings.length}</p><table><thead><tr><th>Severity</th><th>Category</th><th>Finding</th><th>Summary</th><th>Sources</th></tr></thead><tbody>${rows}</tbody></table></body></html>`;
 }
 
 // ---------------------------------------------------------------------------
 // RPC Router + Static dist/ Server
 // ---------------------------------------------------------------------------
 
+// Coerce/validate the start_investigation payload before anything downstream calls
+// `.trim()` on it. A wrong-typed field (e.g. `org: 1`) used to throw inside the
+// un-awaited async run and take the whole backend down.
+function normalizeInvestigationInput(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Invalid input: input must be an object");
+  }
+  const fullName = typeof raw.full_name === "string" ? raw.full_name.trim() : "";
+  if (!fullName) throw new Error("Full Name is required");
+  if (fullName.length > 200) {
+    throw new Error("Invalid input: full_name must be 200 characters or fewer");
+  }
+
+  const stringField = (field, cap) => {
+    const v = raw[field];
+    if (v === undefined || v === null) return "";
+    if (typeof v !== "string") throw new Error(`Invalid input: ${field} must be a string`);
+    return v.trim().slice(0, cap);
+  };
+
+  const depthRaw = Number(raw.depth_level);
+  const depthLevel = Number.isFinite(depthRaw) ? Math.max(1, Math.min(4, Math.round(depthRaw))) : 2;
+
+  return {
+    ...raw,
+    full_name: fullName,
+    org: stringField("org", 200),
+    handle: stringField("handle", 64),
+    email: stringField("email", 254),
+    phone: stringField("phone", 32),
+    domain: stringField("domain", 253),
+    depth_level: depthLevel,
+    enable_tor: typeof raw.enable_tor === "boolean" ? raw.enable_tor : false,
+    strict_anonymity: typeof raw.strict_anonymity === "boolean" ? raw.strict_anonymity : true,
+    passive_only: typeof raw.passive_only === "boolean" ? raw.passive_only : false,
+  };
+}
+
 async function handleRpc(cmd, args = {}) {
   switch (cmd) {
     case "start_investigation": {
-      const input = args.input;
-      if (!input?.full_name?.trim()) throw new Error("Full Name is required");
+      const input = normalizeInvestigationInput(args.input);
       const caseId = crypto.randomUUID();
       const snap = {
         case_id: caseId,
@@ -7296,6 +8108,7 @@ async function handleRpc(cmd, args = {}) {
         tool_runs: [],
         stats: {
           total_nodes: 0,
+          quarantined_nodes: 0,
           confirmed_anchors: 0,
           verified_findings: 0,
           low_conf_findings: 0,
@@ -7307,7 +8120,9 @@ async function handleRpc(cmd, args = {}) {
       };
       state.cases.set(caseId, snap);
       persistCases();
-      void runInvestigation(caseId, input, { ...state.config });
+      void runInvestigation(caseId, input, { ...state.config }).catch((e) =>
+        logRuntime("[Investigation] unhandled: " + ((e && e.message) || e))
+      );
       return caseId;
     }
     case "deepen_node": {
@@ -7331,14 +8146,20 @@ async function handleRpc(cmd, args = {}) {
     case "list_cases": {
       return Array.from(state.cases.values())
         .sort((a, b) => b.created_at.localeCompare(a.created_at))
-        .map((c) => ({
-          case_id: c.case_id,
-          full_name: c.input.full_name,
-          created_at: c.created_at,
-          node_count: c.nodes.length,
-          finding_count: c.findings.length,
-          darkweb_count: c.stats.darkweb_hits + c.stats.breach_hits,
-        }));
+        .map((c) => {
+          // G2 / ACC-2: quarantined nodes and their findings are not counted.
+          const quarantinedIds = new Set(
+            c.nodes.filter((n) => n.status === "quarantined").map((n) => n.id)
+          );
+          return {
+            case_id: c.case_id,
+            full_name: c.input.full_name,
+            created_at: c.created_at,
+            node_count: c.nodes.length - quarantinedIds.size,
+            finding_count: c.findings.filter((f) => !quarantinedIds.has(f.node_id)).length,
+            darkweb_count: c.stats.darkweb_hits + c.stats.breach_hits,
+          };
+        });
     }
     case "purge_case": {
       state.cases.delete(args.caseId);
@@ -7360,7 +8181,7 @@ async function handleRpc(cmd, args = {}) {
       const hasCustomProxy = Boolean(state.config.proxy_url?.trim());
       return {
         tor_socks_available: tor.available,
-        tor_endpoint: tor.endpoint,
+        tor_endpoint: redactProxyUrl(tor.endpoint) || tor.endpoint,
         tor_exit_ip: exitIp,
         anonymity_active: tor.available || hasCustomProxy,
         anonymity_mode: tor.available
@@ -7373,10 +8194,34 @@ async function handleRpc(cmd, args = {}) {
       };
     }
     case "save_auth_config": {
+      const corpusDir = args.config?.local_corpus_dir?.trim() || DEFAULT_CORPUS_DIR;
+      if (isUnsafeCorpusRoot(corpusDir)) {
+        throw new Error(
+          "Local corpus folder must be a dedicated subfolder (not a drive root, Windows/Program Files, or your home root)."
+        );
+      }
+      // SEC-4 round-trip guard: the UI is shown a masked proxy (`user:***@host`).
+      // If it echoes that mask back unchanged, keep the real secret server-side
+      // instead of overwriting it with literal asterisks.
+      const incomingProxy = args.config?.proxy_url ?? null;
+      const incomingTor = args.config?.tor_socks_url ?? null;
+      const isMaskedProxyEcho = (incoming, existing) => {
+        if (typeof incoming !== "string" || !existing) return false;
+        const trimmed = incoming.trim();
+        if (!trimmed) return false;
+        if (trimmed === redactProxyUrl(existing)) return true;
+        return /\/\/(?:[^@/\s]*:)?\*{3}@/.test(trimmed);
+      };
+      const nextProxy = isMaskedProxyEcho(incomingProxy, state.config.proxy_url)
+        ? state.config.proxy_url
+        : incomingProxy;
+      const nextTor = isMaskedProxyEcho(incomingTor, state.config.tor_socks_url)
+        ? state.config.tor_socks_url
+        : incomingTor || "socks5h://127.0.0.1:9050";
       state.config = {
-        tor_socks_url: args.config?.tor_socks_url || "socks5h://127.0.0.1:9050",
-        proxy_url: args.config?.proxy_url || null,
-        local_corpus_dir: args.config?.local_corpus_dir?.trim() || DEFAULT_CORPUS_DIR,
+        tor_socks_url: nextTor,
+        proxy_url: nextProxy,
+        local_corpus_dir: corpusDir,
         custom_onion_seeds: Array.isArray(args.config?.custom_onion_seeds)
           ? args.config.custom_onion_seeds
           : [...DEFAULT_ONION_SEEDS],
@@ -7385,7 +8230,12 @@ async function handleRpc(cmd, args = {}) {
       return null;
     }
     case "get_auth_config": {
-      return state.config;
+      return {
+        ...state.config,
+        proxy_url: redactProxyUrl(state.config.proxy_url),
+        tor_socks_url:
+          redactProxyUrl(state.config.tor_socks_url) || state.config.tor_socks_url,
+      };
     }
     case "export_dossier_html": {
       const snap = state.cases.get(args.caseId);
@@ -7487,11 +8337,42 @@ function openDesktopWindow(url) {
   child.unref();
 }
 
+// Trust gate for browser-facing endpoints. The app itself is served from
+// http://127.0.0.1:<port>, so its requests always carry a loopback Host (and, when
+// present, a matching Origin) and are never flagged `Sec-Fetch-Site: cross-site`.
+// This blocks DNS-rebinding (Host mismatch) and cross-site form/fetch CSRF without
+// requiring any frontend changes or a token.
+function isTrustedBrowserRequest(req) {
+  const host = String(req.headers.host || "").toLowerCase();
+  // allow 127.0.0.1[:port], localhost[:port], [::1][:port]
+  const hostOk = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(host);
+  if (!hostOk) return false;
+  const site = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  if (site === "cross-site") return false;
+  const origin = String(req.headers.origin || "").toLowerCase();
+  if (origin) {
+    let oHost = "";
+    try {
+      oHost = new URL(origin).host.toLowerCase();
+    } catch {
+      return false;
+    }
+    if (oHost !== host) return false;
+  }
+  return true;
+}
+
+const JSON_HEADERS = {
+  "Content-Type": "application/json",
+  "X-Content-Type-Options": "nosniff",
+  "Cache-Control": "no-store",
+};
+
 const server = http.createServer(async (req, res) => {
   const reqUrl = new URL(req.url || "/", "http://127.0.0.1");
 
   if (reqUrl.pathname === "/__tauf_health__") {
-    res.writeHead(200, { "Content-Type": "application/json" });
+    res.writeHead(200, JSON_HEADERS);
     return res.end(
       JSON.stringify({
         ok: true,
@@ -7505,8 +8386,11 @@ const server = http.createServer(async (req, res) => {
 
   if (reqUrl.pathname === "/__tauf_shutdown__" && req.method === "POST") {
     const remote = req.socket?.remoteAddress || "";
-    if (remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1") {
-      res.writeHead(200, { "Content-Type": "application/json" });
+    const isLoopback = remote === "127.0.0.1" || remote === "::1" || remote === "::ffff:127.0.0.1";
+    // The launcher-only header is a non-simple header: a cross-origin page would need
+    // a CORS preflight (never answered) to send it, so the app cannot be killed remotely.
+    if (isLoopback && req.headers["x-tauf-launcher"] === "1") {
+      res.writeHead(200, JSON_HEADERS);
       res.end(JSON.stringify({ ok: true, shutting_down: true }));
       setTimeout(() => {
         stopSupervisedTor();
@@ -7514,11 +8398,19 @@ const server = http.createServer(async (req, res) => {
       }, 150);
       return;
     }
-    res.writeHead(403, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ ok: false, error: "Loopback only" }));
+    res.writeHead(403, JSON_HEADERS);
+    return res.end(JSON.stringify({ ok: false, error: "Loopback + launcher header required" }));
   }
 
   if (reqUrl.pathname === "/events") {
+    if (!isTrustedBrowserRequest(req)) {
+      res.writeHead(403, JSON_HEADERS);
+      return res.end(JSON.stringify({ ok: false, error: "Untrusted request origin" }));
+    }
+    if (state.sseClients.size >= 8) {
+      res.writeHead(429, JSON_HEADERS);
+      return res.end(JSON.stringify({ ok: false, error: "Too many live event streams (max 8)" }));
+    }
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -7528,7 +8420,17 @@ const server = http.createServer(async (req, res) => {
     state.hasHadSseClient = true;
     cancelIdleShutdown();
     state.sseClients.add(res);
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(": ping\n\n");
+      } catch {
+        clearInterval(heartbeat);
+        state.sseClients.delete(res);
+      }
+    }, 15_000);
+    heartbeat.unref?.();
     req.on("close", () => {
+      clearInterval(heartbeat);
       state.sseClients.delete(res);
       scheduleIdleShutdownIfNeeded();
     });
@@ -7536,15 +8438,37 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (reqUrl.pathname === "/rpc" && req.method === "POST") {
+    const contentType = String(req.headers["content-type"] || "").toLowerCase();
+    // Reject before reading the body: no cross-site POST, no JSON CSRF.
+    if (!isTrustedBrowserRequest(req) || !contentType.startsWith("application/json")) {
+      res.writeHead(403, JSON_HEADERS);
+      return res.end(JSON.stringify({ ok: false, error: "Forbidden" }));
+    }
+    const MAX_RPC_BODY_BYTES = 1024 * 1024;
+    const declaredLength = Number(req.headers["content-length"]);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_RPC_BODY_BYTES) {
+      res.writeHead(413, { ...JSON_HEADERS, Connection: "close" });
+      return res.end(JSON.stringify({ ok: false, error: "Payload Too Large" }));
+    }
     const chunks = [];
-    for await (const c of req) chunks.push(c);
+    let totalBytes = 0;
+    for await (const c of req) {
+      totalBytes += c.length;
+      if (totalBytes > MAX_RPC_BODY_BYTES) {
+        res.writeHead(413, { ...JSON_HEADERS, Connection: "close" });
+        res.end(JSON.stringify({ ok: false, error: "Payload Too Large" }));
+        res.once("finish", () => req.destroy());
+        return;
+      }
+      chunks.push(c);
+    }
     try {
       const body = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
       const data = await handleRpc(body.cmd, body.args || {});
-      res.writeHead(200, { "Content-Type": "application/json" });
+      res.writeHead(200, JSON_HEADERS);
       res.end(JSON.stringify({ ok: true, data }));
     } catch (err) {
-      res.writeHead(400, { "Content-Type": "application/json" });
+      res.writeHead(400, JSON_HEADERS);
       res.end(
         JSON.stringify({
           ok: false,
@@ -7602,7 +8526,11 @@ async function main() {
       try {
         await fetchDirectWithTimeout(
           `http://127.0.0.1:${preferredPort}/__tauf_shutdown__`,
-          { method: "POST" },
+          {
+            method: "POST",
+            headers: { "X-TAUF-Launcher": "1", "Content-Type": "application/json" },
+            body: JSON.stringify({ reason: "stale-server-replaced" }),
+          },
           800
         );
         await new Promise((r) => setTimeout(r, 650));

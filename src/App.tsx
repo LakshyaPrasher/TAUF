@@ -122,7 +122,9 @@ function mergeById<T extends { id: string }>(list: T[], item: T): T[] {
 }
 
 function deriveQuickStats(snap: CaseSnapshot): CaseSnapshot["stats"] {
-  const activeNodes = snap.nodes.filter((n) => n.status !== "dismissed");
+  const activeNodes = snap.nodes.filter(
+    (n) => n.status !== "dismissed" && n.status !== "quarantined"
+  );
   const confirmedAnchors = activeNodes.filter(
     (n) => n.layer === "anchor" || n.status === "confirmed"
   ).length;
