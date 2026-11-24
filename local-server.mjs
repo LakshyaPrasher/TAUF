@@ -127,6 +127,10 @@ const FREE_MAIL_DOMAINS = new Set([
 const PLATFORM_NOISE_DOMAINS = [
   "example.com",
   "example.org",
+  "example.net",
+  "domain.com",
+  "yourdomain.com",
+  "test.com",
   "users.noreply.github.com",
   "sentry.io",
   "w3.org",
